@@ -1,5 +1,9 @@
 {
   "functions": {
+    "api/webhook/quiz-submitted.js": {
+      "memory": 128,
+      "maxDuration": 60
+    },
     "api/**/*.js": {
       "memory": 128,
       "maxDuration": 10
