@@ -1,3 +1,10 @@
+# Env locali
+.env.local
+.env.*.local
+
+# Dipendenze
+node_modules/
+
 # Logs
 logs
 *.log
@@ -69,6 +76,7 @@ web_modules/
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache

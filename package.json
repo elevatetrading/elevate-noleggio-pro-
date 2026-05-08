@@ -1,0 +1,13 @@
+{
+  "name": "noleggio-pro-backend",
+  "version": "1.0.0",
+  "description": "Orchestratore GHL <-> Vapi per Noleggio Pro",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5"
+  }
+}
