@@ -2,9 +2,30 @@ import twilio from 'twilio';
 import OpenAI from 'openai';
 import { URLSearchParams } from 'url';
 import { Redis } from '@upstash/redis';
+import axios from 'axios';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'incoming-sms';
+
+function internalUrl(path) {
+  if (process.env.BASE_URL) return `${process.env.BASE_URL}${path}`;
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}${path}`;
+  return `http://localhost:3000${path}`;
+}
+
+// Parser robusto per la risposta JSON di OpenAI (gestisce markdown code block)
+function parseOpenAiJson(content) {
+  try { return JSON.parse(content); } catch {}
+  try {
+    const clean = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    return JSON.parse(clean);
+  } catch {}
+  try {
+    const match = content.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+  } catch {}
+  return null;
+}
 
 const CHAT_SETTER_PROMPT = `# RUOLO
 Sei Sara, assistente di AutoExperience (noleggio a lungo termine, Siracusa). Rispondi via SMS a un lead che ha compilato un quiz sul sito.
@@ -28,7 +49,17 @@ Qualificare il lead in 4-5 messaggi raccogliendo: tipo cliente (privato o partit
 - Se non interessato: ringrazia, chiudi
 
 # CHIUSURA
-Quando hai info sufficienti: "Perfetto, ti faccio richiamare a breve da un commerciale per un preventivo personalizzato. Buona giornata!"`;
+Quando hai info sufficienti: "Perfetto, ti faccio richiamare a breve da un commerciale per un preventivo personalizzato. Buona giornata!"
+
+# OUTPUT JSON
+Rispondi SEMPRE e SOLO con un oggetto JSON valido, senza markdown. Struttura:
+{
+  "response": "<il messaggio SMS da inviare al lead, max 3 righe>",
+  "intent_score": <0-100, quanto sembra deciso ad andare avanti>,
+  "qualifica_score": <0-100, quanto sta fornendo informazioni utili>,
+  "engagement_score": <0-100, quanto è ingaggiato nella conversazione>,
+  "ready_for_handoff": <true se serve passare subito al commerciale, false altrimenti>
+}`;
 
 export default async function handler(req, res) {
   const timestamp = new Date().toISOString();
@@ -81,26 +112,53 @@ export default async function handler(req, res) {
       { role: 'user', content: incomingText },
     ];
 
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Contesto conversazione: ${history.length} messaggi precedenti`);
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Contesto: ${history.length} messaggi precedenti`);
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.6,
-      max_tokens: 200,
+      max_tokens: 300,
       messages,
     });
 
-    const reply = completion.choices[0].message.content;
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Risposta OpenAI: "${reply}"`);
+    const rawContent = completion.choices[0].message.content;
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Risposta OpenAI raw: ${rawContent}`);
 
-    await twilioClient.messages.create({
-      body: reply,
-      from: ourNumber,
-      to: from,
-    });
+    // Parsing JSON — con fallback su testo puro se il formato non è valido
+    const parsed = parseOpenAiJson(rawContent);
+    const reply = parsed?.response ?? rawContent;
 
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Risposta SMS inviata a ${from}`);
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Risposta SMS: "${reply}"`);
+
+    await twilioClient.messages.create({ body: reply, from: ourNumber, to: from });
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] SMS inviato a ${from}`);
+
+    // Aggiorna score se il parsing è andato a buon fine
+    if (parsed && parsed.intent_score != null) {
+      console.log(
+        `[${new Date().toISOString()}] [${ENDPOINT}] Score: ` +
+        `intent=${parsed.intent_score} qualifica=${parsed.qualifica_score} ` +
+        `engagement=${parsed.engagement_score} handoff=${parsed.ready_for_handoff}`
+      );
+      try {
+        await axios.post(
+          internalUrl('/api/webhook/score-update'),
+          {
+            phone: from,
+            intent_score: parsed.intent_score,
+            qualifica_score: parsed.qualifica_score,
+            engagement_score: parsed.engagement_score,
+            ready_for_handoff: parsed.ready_for_handoff,
+          },
+          { timeout: 10000 }
+        );
+      } catch (e) {
+        console.warn(`[${new Date().toISOString()}] [${ENDPOINT}] Errore score-update (non bloccante):`, e.message);
+      }
+    } else {
+      console.warn(`[${new Date().toISOString()}] [${ENDPOINT}] JSON scoring non valido — skip score-update`);
+    }
 
     // TwiML vuoto richiesto da Twilio per confermare ricezione
     res.setHeader('Content-Type', 'text/xml');
