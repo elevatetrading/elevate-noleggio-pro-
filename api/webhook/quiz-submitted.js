@@ -54,7 +54,7 @@ export default async function handler(req, res) {
 
     // 30s placeholder — slot riservato alla chat AI; la Vapi call è il fallback
     console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Attesa 30s (slot riservato alla chat AI)...`);
-    await sleep(30_000);
+    await sleep(300_000);
 
     const callBody = {
       phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
