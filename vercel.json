@@ -4,6 +4,10 @@
       "memory": 128,
       "maxDuration": 60
     },
+    "api/webhook/incoming-sms.js": {
+      "memory": 128,
+      "maxDuration": 30
+    },
     "api/**/*.js": {
       "memory": 128,
       "maxDuration": 10

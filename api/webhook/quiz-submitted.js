@@ -1,4 +1,5 @@
 import axios from 'axios';
+import twilio from 'twilio';
 
 const ENDPOINT = 'quiz-submitted';
 
@@ -28,8 +29,31 @@ export default async function handler(req, res) {
       urgenza,
     } = payload;
 
-    // 30s placeholder — quando aggiungeremo la chat AI avrà priorità, la voice è il fallback
-    console.log(`[${timestamp}] [${ENDPOINT}] Attesa 30s (slot riservato alla chat AI)...`);
+    // --- SMS iniziale di apertura conversazione ---
+    const greeting = first_name
+      ? `Ciao ${first_name}!`
+      : 'Ciao!';
+    const smsBody =
+      `${greeting} Sono Sara di AutoExperience. Hai appena compilato il quiz sul noleggio. ` +
+      `Posso farti un paio di domande veloci per capire come posso aiutarti?`;
+
+    try {
+      const twilioClient = twilio(
+        process.env.TWILIO_ACCOUNT_SID,
+        process.env.TWILIO_AUTH_TOKEN
+      );
+      const smsResult = await twilioClient.messages.create({
+        body: smsBody,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phone,
+      });
+      console.log(`[${new Date().toISOString()}] [${ENDPOINT}] SMS inviato — sid: ${smsResult.sid}`);
+    } catch (smsErr) {
+      console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore invio SMS (non bloccante):`, smsErr.message);
+    }
+
+    // 30s placeholder — slot riservato alla chat AI; la Vapi call è il fallback
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Attesa 30s (slot riservato alla chat AI)...`);
     await sleep(30_000);
 
     const callBody = {
