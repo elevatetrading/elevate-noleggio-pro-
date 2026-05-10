@@ -1,11 +1,8 @@
-import axios from 'axios';
 import twilio from 'twilio';
+import { Redis } from '@upstash/redis';
 
+const redis = Redis.fromEnv();
 const ENDPOINT = 'quiz-submitted';
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 export default async function handler(req, res) {
   const timestamp = new Date().toISOString();
@@ -30,9 +27,7 @@ export default async function handler(req, res) {
     } = payload;
 
     // --- SMS iniziale di apertura conversazione ---
-    const greeting = first_name
-      ? `Ciao ${first_name}!`
-      : 'Ciao!';
+    const greeting = first_name ? `Ciao ${first_name}!` : 'Ciao!';
     const smsBody =
       `${greeting} Sono Sara di AutoExperience. Hai appena compilato il quiz sul noleggio. ` +
       `Posso farti un paio di domande veloci per capire come posso aiutarti?`;
@@ -52,49 +47,21 @@ export default async function handler(req, res) {
       console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore invio SMS (non bloccante):`, smsErr.message);
     }
 
-    // 30s placeholder — slot riservato alla chat AI; la Vapi call è il fallback
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Attesa 30s (slot riservato alla chat AI)...`);
-    await sleep(300_000);
+    // Salva i dati del lead su Redis con TTL 600s (10 min)
+    // Se il lead risponde via SMS prima dello scadere, incoming-sms.js cancella questa chiave
+    // e GHL non riceverà conferma per avviare la Vapi call
+    const redisKey = `vapi_pending:${phone}`;
+    await redis.set(
+      redisKey,
+      JSON.stringify({ timestamp, customerData: { first_name, phone, tipo_cliente, km_anno, durata_mesi, segmento_auto, urgenza } }),
+      { ex: 600 }
+    );
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Redis: chiave "${redisKey}" salvata con TTL 600s`);
 
-    const callBody = {
-      phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-      assistantId: process.env.VAPI_ASSISTANT_ID,
-      customer: {
-        number: phone,
-      },
-      assistantOverrides: {
-        variableValues: {
-          first_name,
-          tipo_cliente,
-          km_anno,
-          durata_mesi,
-          segmento_auto,
-          urgenza,
-        },
-      },
-    };
-
-    const vapiTs = new Date().toISOString();
-    console.log(`[${vapiTs}] [${ENDPOINT}] Avvio chiamata Vapi:`, JSON.stringify(callBody, null, 2));
-
-    const { data } = await axios.post('https://api.vapi.ai/call/phone', callBody, {
-      headers: {
-        Authorization: `Bearer ${process.env.VAPI_PRIVATE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    const callId = data?.id;
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Chiamata avviata — call_id: ${callId}`);
-
-    return res.status(200).json({ ok: true, call_id: callId });
+    return res.status(200).json({ ok: true, sms_sent: true, vapi_scheduled: true });
   } catch (err) {
     const errTs = new Date().toISOString();
-    if (err.response?.data) {
-      console.error(`[${errTs}] [${ENDPOINT}] Errore Vapi:`, JSON.stringify(err.response.data, null, 2));
-    } else {
-      console.error(`[${errTs}] [${ENDPOINT}] Errore:`, err.message);
-    }
+    console.error(`[${errTs}] [${ENDPOINT}] Errore:`, err.message);
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 }

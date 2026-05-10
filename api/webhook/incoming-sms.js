@@ -1,7 +1,9 @@
 import twilio from 'twilio';
 import OpenAI from 'openai';
 import { URLSearchParams } from 'url';
+import { Redis } from '@upstash/redis';
 
+const redis = Redis.fromEnv();
 const ENDPOINT = 'incoming-sms';
 
 const CHAT_SETTER_PROMPT = `# RUOLO
@@ -46,6 +48,12 @@ export default async function handler(req, res) {
     const incomingText = raw.Body;
 
     console.log(`[${timestamp}] [${ENDPOINT}] SMS da ${from}: "${incomingText}"`);
+
+    // Il lead sta interagendo via SMS: cancella l'eventuale chiamata Vapi schedulata
+    const deleted = await redis.del(`vapi_pending:${from}`);
+    if (deleted) {
+      console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Cancelled scheduled Vapi call for ${from}`);
+    }
 
     const twilioClient = twilio(
       process.env.TWILIO_ACCOUNT_SID,

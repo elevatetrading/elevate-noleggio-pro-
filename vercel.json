@@ -2,9 +2,13 @@
   "functions": {
     "api/webhook/quiz-submitted.js": {
       "memory": 128,
-      "maxDuration": 300
+      "maxDuration": 30
     },
     "api/webhook/incoming-sms.js": {
+      "memory": 128,
+      "maxDuration": 30
+    },
+    "api/webhook/initiate-call.js": {
       "memory": 128,
       "maxDuration": 30
     },
