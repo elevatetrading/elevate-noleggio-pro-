@@ -86,6 +86,10 @@ export default async function handler(req, res) {
       console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Cancelled scheduled Vapi call for ${from}`);
     }
 
+    // Segnala che il lead è attivo — blocca il fallback endpoint per 1h
+    await redis.set(`engaged:${from}`, '1', { ex: 3600 });
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Set engaged:${from} TTL 3600s`);
+
     const twilioClient = twilio(
       process.env.TWILIO_ACCOUNT_SID,
       process.env.TWILIO_AUTH_TOKEN

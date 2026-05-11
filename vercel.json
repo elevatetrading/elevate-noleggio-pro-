@@ -31,6 +31,10 @@
     "api/webhook/landing-contact.js": {
       "memory": 128,
       "maxDuration": 30
+    },
+    "api/webhook/fallback.js": {
+      "memory": 128,
+      "maxDuration": 30
     }
   }
 }
