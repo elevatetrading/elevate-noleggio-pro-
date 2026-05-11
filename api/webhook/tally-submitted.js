@@ -290,10 +290,10 @@ export default async function handler(req, res) {
       segmento_auto       != null && { key: 'segmento_auto',       field_value: segmento_auto },
       km_anno             != null && { key: 'km_anno',             field_value: km_anno },
       budget_mensile      != null && { key: 'budget_mensile',      field_value: budget_mensile },
-      // Consensi come boolean (tipo Checkbox in GHL)
-      consenso_privacy    != null && { key: 'consenso_privacy',    field_value: consenso_privacy },
-      consenso_chiamate   != null && { key: 'consenso_chiamate',   field_value: consenso_chiamate },
-      consenso_marketing  != null && { key: 'consenso_marketing',  field_value: consenso_marketing },
+      // Consensi come "Sì"/"No" (GHL Single Line Text / Dropdown)
+      consenso_privacy    != null && { key: 'consenso_privacy',    field_value: consenso_privacy    ? 'Sì' : 'No' },
+      consenso_chiamate   != null && { key: 'consenso_chiamate',   field_value: consenso_chiamate   ? 'Sì' : 'No' },
+      consenso_marketing  != null && { key: 'consenso_marketing',  field_value: consenso_marketing  ? 'Sì' : 'No' },
       // quiz_score sempre presente
                                      { key: 'quiz_score',          field_value: quiz_score },
     ].filter(Boolean);
