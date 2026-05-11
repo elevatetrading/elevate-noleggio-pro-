@@ -1,11 +1,10 @@
 import crypto from 'crypto';
-import axios from 'axios';
 import { Redis } from '@upstash/redis';
 import { normalizePhone, mapChannel, resolveChannelState, executeChannelAction } from '../../lib/channel-actions.js';
+import { upsertContact } from '../../lib/ghl.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'tally-submitted';
-const GHL_BASE = 'https://services.leadconnectorhq.com';
 
 // ─── HMAC verification ────────────────────────────────────────────────────────
 function verifySignature(req) {
@@ -274,21 +273,7 @@ export default async function handler(req, res) {
       customFields,
     };
 
-    log('Upsert GHL in corso…');
-    const { data: ghlData } = await axios.post(
-      `${GHL_BASE}/contacts/upsert`,
-      upsertPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-          'Content-Type': 'application/json',
-          Version: '2021-07-28',
-        },
-      }
-    );
-
-    const contactId = ghlData?.contact?.id ?? ghlData?.id;
-    log(`Contatto GHL upserted — contactId: ${contactId}`);
+    const { contactId } = await upsertContact(upsertPayload, phone);
 
     if (whatsappDegraded) {
       log(`WARN: WhatsApp request degraded to SMS, contact_id=${contactId}`);

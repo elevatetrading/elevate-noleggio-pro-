@@ -1,4 +1,3 @@
-import axios from 'axios';
 import { Redis } from '@upstash/redis';
 import {
   normalizePhone,
@@ -6,10 +5,10 @@ import {
   resolveChannelState,
   executeChannelAction,
 } from '../../lib/channel-actions.js';
+import { upsertContact } from '../../lib/ghl.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'landing-contact';
-const GHL_BASE = 'https://services.leadconnectorhq.com';
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email ?? ''));
@@ -85,21 +84,7 @@ export default async function handler(req, res) {
       customFields,
     };
 
-    log('Upsert GHL in corso…');
-    const { data: ghlData } = await axios.post(
-      `${GHL_BASE}/contacts/upsert`,
-      upsertPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-          'Content-Type': 'application/json',
-          Version: '2021-07-28',
-        },
-      }
-    );
-
-    const contactId = ghlData?.contact?.id ?? ghlData?.id;
-    log(`Contatto GHL upserted — contactId: ${contactId}`);
+    const { contactId } = await upsertContact(upsertPayload, phone);
 
     if (whatsappDegraded) {
       log(`WARN: WhatsApp request degraded to SMS, contact_id=${contactId}`);
