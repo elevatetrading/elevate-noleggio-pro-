@@ -1,8 +1,7 @@
 import crypto from 'crypto';
-import twilio from 'twilio';
 import axios from 'axios';
 import { Redis } from '@upstash/redis';
-import { isCallingHourAllowed, nextAllowedCallTime } from '../../lib/business-hours.js';
+import { normalizePhone, mapChannel, resolveChannelState, executeChannelAction } from '../../lib/channel-actions.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'tally-submitted';
@@ -118,15 +117,6 @@ function extractConsents(fields) {
     }
   }
   return result;
-}
-
-// ─── Phone normalization ──────────────────────────────────────────────────────
-function normalizePhone(raw) {
-  if (!raw) return null;
-  let n = String(raw).replace(/[\s\-().]/g, '');
-  if (n.startsWith('00')) n = '+' + n.slice(2);
-  if (!n.startsWith('+')) n = '+39' + n;
-  return /^\+\d{10,15}$/.test(n) ? n : null;
 }
 
 // ─── Quiz score ───────────────────────────────────────────────────────────────
@@ -248,40 +238,9 @@ export default async function handler(req, res) {
     log(`quiz_score: ${quiz_score}/100`);
 
     // ── Routing canale ────────────────────────────────────────────────────
-    const now = new Date();
-    let primary;
-    let whatsappDegraded = false;
-
-    if (!contatto_preferito || contatto_preferito === 'SMS') {
-      primary = 'sms';
-    } else if (contatto_preferito === 'Chiamata telefonica') {
-      primary = 'call';
-    } else if (/whatsapp/i.test(contatto_preferito)) {
-      primary = 'sms';
-      whatsappDegraded = true;
-    } else {
-      primary = 'sms';
-      log(`WARN: contatto_preferito non riconosciuto "${contatto_preferito}" → default sms`);
-    }
-
-    let channelStatus;
-    let scheduledFor = null;
-    let actionTaken;
-
-    if (primary === 'call') {
-      if (isCallingHourAllowed(now)) {
-        channelStatus = 'call_initiated';
-        actionTaken = 'call_initiated';
-      } else {
-        scheduledFor = nextAllowedCallTime(now);
-        channelStatus = 'scheduled_call';
-        actionTaken = 'call_scheduled';
-      }
-    } else {
-      channelStatus = 'sms_sent';
-      actionTaken = 'sms_sent';
-    }
-
+    const { primary, whatsappDegraded, unknownChannel } = mapChannel(contatto_preferito);
+    if (unknownChannel) log(`WARN: contatto_preferito non riconosciuto "${contatto_preferito}" → default sms`);
+    const { channelStatus, actionTaken, scheduledFor } = resolveChannelState(primary);
     const channelTag = primary === 'call' ? 'channel:phone' : 'channel:sms';
     log(`Canale: ${primary} — action: ${actionTaken} — tag: ${channelTag}`);
 
@@ -336,74 +295,21 @@ export default async function handler(req, res) {
     }
 
     // ── Azione immediata in base al canale ────────────────────────────────
-    const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-    if (primary === 'call') {
-      if (actionTaken === 'call_initiated') {
-        // Chiama Vapi subito
-        try {
-          const vapiRes = await axios.post(
-            'https://api.vapi.ai/call/phone',
-            {
-              phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-              assistantId: process.env.VAPI_ASSISTANT_ID,
-              customer: { number: phone },
-              assistantOverrides: {
-                variableValues: { first_name, tipo_cliente, km_anno, segmento_auto, urgenza },
-              },
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${process.env.VAPI_PRIVATE_KEY}`,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
-          log(`Call initiated immediately, callId=${vapiRes.data?.id}`);
-        } catch (vapiErr) {
-          console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore Vapi:`, vapiErr.response?.data ?? vapiErr.message);
-        }
-      } else {
-        // Chiamata schedulata — SMS cortesia
-        const dayHumanReadable = new Intl.DateTimeFormat('it-IT', {
-          timeZone: 'Europe/Rome',
-          weekday: 'long',
-          day: 'numeric',
-          month: 'long',
-        }).format(scheduledFor);
-        const greeting = first_name ? `Ciao ${first_name}` : 'Ciao';
-        const courtesySms =
-          `${greeting}, grazie per aver compilato il quiz! Per rispetto delle normative italiane sulle chiamate ` +
-          `ti contatteremo ${dayHumanReadable} alle 9:00. Se vuoi parlare prima, rispondi a questo messaggio ` +
-          `e ti rispondo subito. Sara di AutoExperience`;
-        try {
-          const sms = await twilioClient.messages.create({
-            body: courtesySms,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: phone,
-          });
-          log(`Call scheduled for ${scheduledFor.toISOString()}, SMS courtesy sent — sid: ${sms.sid}`);
-        } catch (smsErr) {
-          console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore SMS courtesy:`, smsErr.message);
-        }
-      }
-    } else {
-      // Canale SMS — messaggio di apertura conversazione
-      const greeting = first_name ? `Ciao ${first_name}!` : 'Ciao!';
-      const smsBody =
-        `${greeting} Sono Sara di AutoExperience. Hai appena compilato il quiz sul noleggio. ` +
-        `Posso farti un paio di domande veloci per capire come posso aiutarti?`;
-      try {
-        const sms = await twilioClient.messages.create({
-          body: smsBody,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: phone,
-        });
-        log(`Opening SMS sent — sid: ${sms.sid}`);
-      } catch (smsErr) {
-        console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore SMS:`, smsErr.message);
-      }
-    }
+    const smsOpeningBody =
+      `${first_name ? `Ciao ${first_name}!` : 'Ciao!'} Sono Sara di AutoExperience. ` +
+      `Hai appena compilato il quiz sul noleggio. Posso farti un paio di domande veloci per capire come posso aiutarti?`;
+    await executeChannelAction({
+      primary,
+      actionTaken,
+      phone,
+      firstName: first_name,
+      scheduledFor,
+      smsOpeningBody,
+      smsCourtesyIntro: 'grazie per aver compilato il quiz!',
+      vapiVariables: { first_name, tipo_cliente, km_anno, segmento_auto, urgenza },
+      endpoint: ENDPOINT,
+      log,
+    });
 
     // ── Redis: chiave fallback usata dal workflow GHL dopo 30 min ─────────
     const redisKey = `fallback_pending:${phone}`;
