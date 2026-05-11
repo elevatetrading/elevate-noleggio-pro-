@@ -100,6 +100,46 @@ function buildFieldGetter(fields) {
   };
 }
 
+// ─── extractConsents ──────────────────────────────────────────────────────────
+// I checkbox di consenso Tally arrivano con label===null; il testo del consenso
+// è in field.options[0].text. Li identifichiamo per tipo facendo matching
+// case-insensitive su quel testo.
+function extractConsents(fields) {
+  const result = { consenso_privacy: null, consenso_chiamate: null, consenso_marketing: null };
+
+  for (const f of fields ?? []) {
+    if (f.type !== 'CHECKBOXES' || f.label !== null) continue;
+
+    const optionText = f.options?.[0]?.text ?? '';
+    const t = optionText.toLowerCase();
+    const boolValue = Array.isArray(f.value) && f.value.length > 0;
+
+    let consensoKey = null;
+    if (t.includes('trattamento') || t.includes('gdpr') || t.includes('privacy policy')) {
+      consensoKey = 'consenso_privacy';
+    } else if (t.includes('chiamate automatizzate') || t.includes('sistema ai') || t.includes('sms dal sistema')) {
+      consensoKey = 'consenso_chiamate';
+    } else if (t.includes('comunicazioni commerciali') || t.includes('promozionali') || t.includes('marketing')) {
+      consensoKey = 'consenso_marketing';
+    }
+
+    if (consensoKey) {
+      result[consensoKey] = boolValue;
+      console.log(
+        `[tally-submitted] Consenso detected key="${consensoKey}" ` +
+        `from option_text="${optionText.substring(0, 80)}..." value=${boolValue}`
+      );
+    } else {
+      console.warn(
+        `[tally-submitted] WARN: CHECKBOXES con label null non riconosciuto come consenso, ` +
+        `option_text="${optionText}"`
+      );
+    }
+  }
+
+  return result;
+}
+
 // ─── Phone normalization ──────────────────────────────────────────────────────
 function normalizePhone(raw) {
   if (!raw) return null;
@@ -219,10 +259,8 @@ export default async function handler(req, res) {
     const budget_mensile      = get('Hai un budget mensile orientativo?');
     const contatto_preferito  = get('Come preferisci essere contattato per il preventivo?');
 
-    // Consensi: estratti come boolean (true/false), non stringa
-    const consenso_privacy    = get('Acconsento al trattamento dei miei dati personali ai sensi del GDPR (privacy policy)');
-    const consenso_chiamate   = get("Acconsento a essere contattato tramite chiamate automatizzate e SMS dal sistema AI di [nome concessionario]");
-    const consenso_marketing  = get("Acconsento all'invio di comunicazioni commerciali e promozionali");
+    // Consensi: label===null in Tally, estratti tramite matching su options[0].text
+    const { consenso_privacy, consenso_chiamate, consenso_marketing } = extractConsents(data?.fields);
 
     // ── Valida phone ──────────────────────────────────────────────────────
     const phone = normalizePhone(rawPhone);
