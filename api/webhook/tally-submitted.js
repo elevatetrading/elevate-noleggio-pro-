@@ -2,15 +2,13 @@ import crypto from 'crypto';
 import twilio from 'twilio';
 import axios from 'axios';
 import { Redis } from '@upstash/redis';
+import { isCallingHourAllowed, nextAllowedCallTime } from '../../lib/business-hours.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'tally-submitted';
 const GHL_BASE = 'https://services.leadconnectorhq.com';
 
 // ─── HMAC verification ────────────────────────────────────────────────────────
-// Tally firma il raw body. Vercel parsa il JSON prima di qui, quindi usiamo
-// JSON.stringify come approssimazione. Disabilita TALLY_WEBHOOK_SECRET per ora
-// e riabilita solo dopo aver confermato il formato esatto (hex/base64).
 function verifySignature(req) {
   const secret = process.env.TALLY_WEBHOOK_SECRET;
   if (!secret) {
@@ -34,9 +32,6 @@ function verifySignature(req) {
 }
 
 // ─── extractFieldValue ────────────────────────────────────────────────────────
-// Tally invia field.value come array di UUID per MULTIPLE_CHOICE/DROPDOWN/CHECKBOXES.
-// Gli UUID vanno risolti al testo tramite field.options = [{id, text}].
-// Per campi testuali, restituisce field.value direttamente.
 const CHOICE_TYPES = new Set(['MULTIPLE_CHOICE', 'DROPDOWN', 'RANKING']);
 const CHECKBOX_TYPES = new Set(['CHECKBOXES']);
 const TEXT_TYPES = new Set([
@@ -50,22 +45,18 @@ function extractFieldValue(field) {
   if (CHOICE_TYPES.has(type)) {
     const uuids = Array.isArray(value) ? value : (value ? [value] : []);
     if (uuids.length === 0) return null;
-
     const texts = uuids.map((uuid) => {
       const opt = options.find((o) => o.id === uuid);
       if (!opt) {
         console.warn(`[${ENDPOINT}] WARN: option not found for uuid=${uuid} in field="${label}"`);
-        return uuid; // fallback: tieni UUID grezzo
+        return uuid;
       }
       return opt.text;
     });
-
     return texts.length === 1 ? texts[0] : texts.join(', ');
   }
 
   if (CHECKBOX_TYPES.has(type)) {
-    // Checkbox di consenso: value è array di UUID delle opzioni spuntate
-    // Array non vuoto → spuntato → true, array vuoto/null → false
     if (Array.isArray(value)) return value.length > 0;
     return Boolean(value);
   }
@@ -74,23 +65,19 @@ function extractFieldValue(field) {
     return value ?? null;
   }
 
-  // Tipo non gestito esplicitamente: ritorna as-is con warning
   console.warn(`[${ENDPOINT}] WARN: tipo non gestito "${type}" per field="${label}", ritorno value grezzo`);
   return value ?? null;
 }
 
 // ─── buildFieldGetter ─────────────────────────────────────────────────────────
-// Restituisce get(label) → valore estratto e loggato.
 function buildFieldGetter(fields) {
   const byLabel = {};
   for (const f of fields ?? []) {
     byLabel[f.label] = f;
   }
-
   return function get(label) {
     const f = byLabel[label];
     if (!f) return null;
-
     const extracted = extractFieldValue(f);
     console.log(
       `[${ENDPOINT}] Field "${label}" type=${f.type} ` +
@@ -101,19 +88,14 @@ function buildFieldGetter(fields) {
 }
 
 // ─── extractConsents ──────────────────────────────────────────────────────────
-// I checkbox di consenso Tally arrivano con label===null; il testo del consenso
-// è in field.options[0].text. Li identifichiamo per tipo facendo matching
-// case-insensitive su quel testo.
+// I consensi Tally hanno label===null; il testo è in options[0].text.
 function extractConsents(fields) {
   const result = { consenso_privacy: null, consenso_chiamate: null, consenso_marketing: null };
-
   for (const f of fields ?? []) {
     if (f.type !== 'CHECKBOXES' || f.label !== null) continue;
-
     const optionText = f.options?.[0]?.text ?? '';
     const t = optionText.toLowerCase();
     const boolValue = Array.isArray(f.value) && f.value.length > 0;
-
     let consensoKey = null;
     if (t.includes('trattamento') || t.includes('gdpr') || t.includes('privacy policy')) {
       consensoKey = 'consenso_privacy';
@@ -122,7 +104,6 @@ function extractConsents(fields) {
     } else if (t.includes('comunicazioni commerciali') || t.includes('promozionali') || t.includes('marketing')) {
       consensoKey = 'consenso_marketing';
     }
-
     if (consensoKey) {
       result[consensoKey] = boolValue;
       console.log(
@@ -136,7 +117,6 @@ function extractConsents(fields) {
       );
     }
   }
-
   return result;
 }
 
@@ -150,19 +130,15 @@ function normalizePhone(raw) {
 }
 
 // ─── Quiz score ───────────────────────────────────────────────────────────────
-// Opera SEMPRE su stringhe di testo risolte, mai su UUID.
-// Max lordo ~105, cappato a 100.
 function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_auto, km_anno, budget_mensile, scadenza_noleggio }) {
   let score = 0;
 
-  // tipo_cliente (8–12 pt)
   if (tipo_cliente && typeof tipo_cliente === 'string') {
     if (tipo_cliente === 'Privato') score += 8;
     else if (/P\.?IVA|partita\s*iva/i.test(tipo_cliente)) score += 12;
     else if (/aziend/i.test(tipo_cliente)) score += 12;
   }
 
-  // ha_noleggio_in_corso (5–20 pt)
   if (ha_noleggio_in_corso && typeof ha_noleggio_in_corso === 'string') {
     const v = ha_noleggio_in_corso.toLowerCase();
     if (v.includes('scadenza')) score += 20;
@@ -171,7 +147,6 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
     else if (v.includes("so cos'è") || v.includes('non so cos')) score += 10;
   }
 
-  // urgenza (3–25 pt)
   if (urgenza && typeof urgenza === 'string') {
     const v = urgenza.toLowerCase();
     if (v.includes('subito')) score += 25;
@@ -180,7 +155,6 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
     else if (v.includes('valutando') || v.includes('valuto')) score += 3;
   }
 
-  // segmento_auto (5–15 pt)
   if (segmento_auto && typeof segmento_auto === 'string') {
     const v = segmento_auto.toLowerCase();
     if (v.includes('utilitaria')) score += 5;
@@ -189,10 +163,8 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
     else if (v.includes('premium')) score += 15;
   }
 
-  // km_anno: +5 se ha risposto (info qualifica)
   if (km_anno) score += 5;
 
-  // budget_mensile (3–20 pt)
   if (budget_mensile && typeof budget_mensile === 'string') {
     if (/fino a 300/i.test(budget_mensile)) score += 5;
     else if (/tra 300|300.+500/i.test(budget_mensile)) score += 10;
@@ -201,7 +173,6 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
     else if (/non ho|senza budget/i.test(budget_mensile)) score += 3;
   }
 
-  // BONUS scadenza_noleggio (+10)
   if (scadenza_noleggio && typeof scadenza_noleggio === 'string' && /entro 1 mese/i.test(scadenza_noleggio)) {
     score += 10;
   }
@@ -220,7 +191,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Log completo per debug (rimuovere in produzione stabile)
     console.log(`[${ENDPOINT}] FULL PAYLOAD:`, JSON.stringify(req.body, null, 2));
 
     if (!verifySignature(req)) {
@@ -246,20 +216,19 @@ export default async function handler(req, res) {
     // ── Estrai campi (UUID → testo) ───────────────────────────────────────
     const get = buildFieldGetter(data?.fields);
 
-    const tipo_cliente        = get("Sei un privato, hai partita IVA o sei un'azienda?");
-    const settore_attivita    = get('In che settore lavori?');
+    const tipo_cliente         = get("Sei un privato, hai partita IVA o sei un'azienda?");
+    const settore_attivita     = get('In che settore lavori?');
     const ha_noleggio_in_corso = get('Hai già un noleggio a lungo termine in corso?');
-    const scadenza_noleggio   = get('Quando scade il tuo noleggio?');
-    const first_name          = get('Come ti chiami?');
-    const rawPhone            = get('Numero di telefono');
-    const email               = get('Email');
-    const urgenza             = get("Quando ti servirebbe l'auto?");
-    const segmento_auto       = get('Che tipo di auto stai cercando?');
-    const km_anno             = get('Quanti chilometri all\'anno percorri di solito?');
-    const budget_mensile      = get('Hai un budget mensile orientativo?');
-    const contatto_preferito  = get('Come preferisci essere contattato per il preventivo?');
+    const scadenza_noleggio    = get('Quando scade il tuo noleggio?');
+    const first_name           = get('Come ti chiami?');
+    const rawPhone             = get('Numero di telefono');
+    const email                = get('Email');
+    const urgenza              = get("Quando ti servirebbe l'auto?");
+    const segmento_auto        = get('Che tipo di auto stai cercando?');
+    const km_anno              = get('Quanti chilometri all\'anno percorri di solito?');
+    const budget_mensile       = get('Hai un budget mensile orientativo?');
+    const contatto_preferito   = get('Come preferisci essere contattato per il preventivo?');
 
-    // Consensi: label===null in Tally, estratti tramite matching su options[0].text
     const { consenso_privacy, consenso_chiamate, consenso_marketing } = extractConsents(data?.fields);
 
     // ── Valida phone ──────────────────────────────────────────────────────
@@ -271,16 +240,52 @@ export default async function handler(req, res) {
 
     log(`Lead: ${first_name ?? '(nome assente)'} — phone: ${phone}`);
 
-    // ── Calcola quiz_score su valori testuali risolti ─────────────────────
+    // ── Quiz score ────────────────────────────────────────────────────────
     const quiz_score = calcQuizScore({
       tipo_cliente, ha_noleggio_in_corso, urgenza,
       segmento_auto, km_anno, budget_mensile, scadenza_noleggio,
     });
     log(`quiz_score: ${quiz_score}/100`);
 
-    // ── Componi customFields (skip se null, skip durata_mesi) ─────────────
-    // durata_mesi non è presente nel form Tally — non includere per evitare
-    // di sovrascrivere il placeholder "Es. 12" già visto in produzione.
+    // ── Routing canale ────────────────────────────────────────────────────
+    const now = new Date();
+    let primary;
+    let whatsappDegraded = false;
+
+    if (!contatto_preferito || contatto_preferito === 'SMS') {
+      primary = 'sms';
+    } else if (contatto_preferito === 'Chiamata telefonica') {
+      primary = 'call';
+    } else if (/whatsapp/i.test(contatto_preferito)) {
+      primary = 'sms';
+      whatsappDegraded = true;
+    } else {
+      primary = 'sms';
+      log(`WARN: contatto_preferito non riconosciuto "${contatto_preferito}" → default sms`);
+    }
+
+    let channelStatus;
+    let scheduledFor = null;
+    let actionTaken;
+
+    if (primary === 'call') {
+      if (isCallingHourAllowed(now)) {
+        channelStatus = 'call_initiated';
+        actionTaken = 'call_initiated';
+      } else {
+        scheduledFor = nextAllowedCallTime(now);
+        channelStatus = 'scheduled_call';
+        actionTaken = 'call_scheduled';
+      }
+    } else {
+      channelStatus = 'sms_sent';
+      actionTaken = 'sms_sent';
+    }
+
+    const channelTag = primary === 'call' ? 'channel:phone' : 'channel:sms';
+    log(`Canale: ${primary} — action: ${actionTaken} — tag: ${channelTag}`);
+
+    // ── Componi customFields ──────────────────────────────────────────────
     const customFields = [
       tipo_cliente        != null && { key: 'tipo_cliente',        field_value: tipo_cliente },
       settore_attivita    != null && { key: 'settore_attivita',    field_value: settore_attivita },
@@ -290,12 +295,12 @@ export default async function handler(req, res) {
       segmento_auto       != null && { key: 'segmento_auto',       field_value: segmento_auto },
       km_anno             != null && { key: 'km_anno',             field_value: km_anno },
       budget_mensile      != null && { key: 'budget_mensile',      field_value: budget_mensile },
-      // Consensi come "Sì"/"No" (GHL Single Line Text / Dropdown)
       consenso_privacy    != null && { key: 'consenso_privacy',    field_value: consenso_privacy    ? 'Sì' : 'No' },
       consenso_chiamate   != null && { key: 'consenso_chiamate',   field_value: consenso_chiamate   ? 'Sì' : 'No' },
       consenso_marketing  != null && { key: 'consenso_marketing',  field_value: consenso_marketing  ? 'Sì' : 'No' },
-      // quiz_score sempre presente
                                      { key: 'quiz_score',          field_value: quiz_score },
+                                     { key: 'channel_status',      field_value: channelStatus },
+      scheduledFor != null &&        { key: 'next_contact_at',     field_value: scheduledFor.toISOString() },
     ].filter(Boolean);
 
     log(`customFields payload GHL: ${JSON.stringify(customFields)}`);
@@ -306,7 +311,7 @@ export default async function handler(req, res) {
       ...(first_name && { firstName: first_name }),
       phone,
       ...(email && { email }),
-      tags: ['src:tally'],
+      tags: ['src:tally', channelTag],
       customFields,
     };
 
@@ -326,40 +331,101 @@ export default async function handler(req, res) {
     const contactId = ghlData?.contact?.id ?? ghlData?.id;
     log(`Contatto GHL upserted — contactId: ${contactId}`);
 
-    // ── SMS apertura ──────────────────────────────────────────────────────
-    const greeting = first_name ? `Ciao ${first_name}!` : 'Ciao!';
-    const smsBody =
-      `${greeting} Sono Sara di AutoExperience. Hai appena compilato il quiz sul noleggio. ` +
-      `Posso farti un paio di domande veloci per capire come posso aiutarti?`;
-
-    try {
-      const twilioClient = twilio(
-        process.env.TWILIO_ACCOUNT_SID,
-        process.env.TWILIO_AUTH_TOKEN
-      );
-      const sms = await twilioClient.messages.create({
-        body: smsBody,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: phone,
-      });
-      log(`SMS inviato — sid: ${sms.sid}`);
-    } catch (smsErr) {
-      console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore SMS (non bloccante):`, smsErr.message);
+    if (whatsappDegraded) {
+      log(`WARN: WhatsApp request degraded to SMS, contact_id=${contactId}`);
     }
 
-    // ── Upstash: schedula Vapi call fallback (TTL 600s) ───────────────────
-    const redisKey = `vapi_pending:${phone}`;
+    // ── Azione immediata in base al canale ────────────────────────────────
+    const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+    if (primary === 'call') {
+      if (actionTaken === 'call_initiated') {
+        // Chiama Vapi subito
+        try {
+          const vapiRes = await axios.post(
+            'https://api.vapi.ai/call/phone',
+            {
+              phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
+              assistantId: process.env.VAPI_ASSISTANT_ID,
+              customer: { number: phone },
+              assistantOverrides: {
+                variableValues: { first_name, tipo_cliente, km_anno, segmento_auto, urgenza },
+              },
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.VAPI_PRIVATE_KEY}`,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+          log(`Call initiated immediately, callId=${vapiRes.data?.id}`);
+        } catch (vapiErr) {
+          console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore Vapi:`, vapiErr.response?.data ?? vapiErr.message);
+        }
+      } else {
+        // Chiamata schedulata — SMS cortesia
+        const dayHumanReadable = new Intl.DateTimeFormat('it-IT', {
+          timeZone: 'Europe/Rome',
+          weekday: 'long',
+          day: 'numeric',
+          month: 'long',
+        }).format(scheduledFor);
+        const greeting = first_name ? `Ciao ${first_name}` : 'Ciao';
+        const courtesySms =
+          `${greeting}, grazie per aver compilato il quiz! Per rispetto delle normative italiane sulle chiamate ` +
+          `ti contatteremo ${dayHumanReadable} alle 9:00. Se vuoi parlare prima, rispondi a questo messaggio ` +
+          `e ti rispondo subito. Sara di AutoExperience`;
+        try {
+          const sms = await twilioClient.messages.create({
+            body: courtesySms,
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: phone,
+          });
+          log(`Call scheduled for ${scheduledFor.toISOString()}, SMS courtesy sent — sid: ${sms.sid}`);
+        } catch (smsErr) {
+          console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore SMS courtesy:`, smsErr.message);
+        }
+      }
+    } else {
+      // Canale SMS — messaggio di apertura conversazione
+      const greeting = first_name ? `Ciao ${first_name}!` : 'Ciao!';
+      const smsBody =
+        `${greeting} Sono Sara di AutoExperience. Hai appena compilato il quiz sul noleggio. ` +
+        `Posso farti un paio di domande veloci per capire come posso aiutarti?`;
+      try {
+        const sms = await twilioClient.messages.create({
+          body: smsBody,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: phone,
+        });
+        log(`Opening SMS sent — sid: ${sms.sid}`);
+      } catch (smsErr) {
+        console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore SMS:`, smsErr.message);
+      }
+    }
+
+    // ── Redis: chiave fallback usata dal workflow GHL dopo 30 min ─────────
+    const redisKey = `fallback_pending:${phone}`;
     await redis.set(
       redisKey,
       JSON.stringify({
+        primary,
+        ...(scheduledFor && { scheduledFor: scheduledFor.toISOString() }),
+        contact_id: contactId,
         timestamp,
-        customerData: { first_name, phone, tipo_cliente, km_anno, segmento_auto, urgenza },
       }),
-      { ex: 600 }
+      { ex: 86400 }
     );
-    log(`Redis: "${redisKey}" salvata con TTL 600s`);
+    log(`Redis: "${redisKey}" salvata con TTL 86400s`);
 
-    return res.status(200).json({ ok: true, contact_created: true, quiz_score, contactId });
+    return res.status(200).json({
+      ok: true,
+      contact_created: true,
+      contactId,
+      primary_channel: primary,
+      action_taken: actionTaken,
+    });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore:`, err.message, err.stack);
     return res.status(500).json({ error: 'Internal Server Error' });
