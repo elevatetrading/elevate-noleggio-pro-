@@ -8,11 +8,9 @@ const ENDPOINT = 'tally-submitted';
 const GHL_BASE = 'https://services.leadconnectorhq.com';
 
 // ─── HMAC verification ────────────────────────────────────────────────────────
-// Tally firma il raw body con HMAC-SHA256 e invia la firma in X-Tally-Signature.
-// Vercel parsa il body JSON prima che arrivi qui, quindi usiamo JSON.stringify
-// come approssimazione. Se i byte non combaciano esattamente, disabilita la
-// verifica per ora e riabilita con TALLY_WEBHOOK_SECRET dopo aver confermato
-// il formato esatto usato da Tally (hex o base64).
+// Tally firma il raw body. Vercel parsa il JSON prima di qui, quindi usiamo
+// JSON.stringify come approssimazione. Disabilita TALLY_WEBHOOK_SECRET per ora
+// e riabilita solo dopo aver confermato il formato esatto (hex/base64).
 function verifySignature(req) {
   const secret = process.env.TALLY_WEBHOOK_SECRET;
   if (!secret) {
@@ -35,9 +33,54 @@ function verifySignature(req) {
   }
 }
 
-// ─── Field extractor ─────────────────────────────────────────────────────────
-// Restituisce una funzione get(label) → stringa | null
-// Gestisce i tipi Tally più comuni (testo, scelta singola, checkbox, dropdown).
+// ─── extractFieldValue ────────────────────────────────────────────────────────
+// Tally invia field.value come array di UUID per MULTIPLE_CHOICE/DROPDOWN/CHECKBOXES.
+// Gli UUID vanno risolti al testo tramite field.options = [{id, text}].
+// Per campi testuali, restituisce field.value direttamente.
+const CHOICE_TYPES = new Set(['MULTIPLE_CHOICE', 'DROPDOWN', 'RANKING']);
+const CHECKBOX_TYPES = new Set(['CHECKBOXES']);
+const TEXT_TYPES = new Set([
+  'INPUT_TEXT', 'TEXTAREA', 'INPUT_EMAIL',
+  'INPUT_PHONE_NUMBER', 'INPUT_NUMBER', 'INPUT_DATE', 'INPUT_LINK',
+]);
+
+function extractFieldValue(field) {
+  const { type, value, options = [], label } = field;
+
+  if (CHOICE_TYPES.has(type)) {
+    const uuids = Array.isArray(value) ? value : (value ? [value] : []);
+    if (uuids.length === 0) return null;
+
+    const texts = uuids.map((uuid) => {
+      const opt = options.find((o) => o.id === uuid);
+      if (!opt) {
+        console.warn(`[${ENDPOINT}] WARN: option not found for uuid=${uuid} in field="${label}"`);
+        return uuid; // fallback: tieni UUID grezzo
+      }
+      return opt.text;
+    });
+
+    return texts.length === 1 ? texts[0] : texts.join(', ');
+  }
+
+  if (CHECKBOX_TYPES.has(type)) {
+    // Checkbox di consenso: value è array di UUID delle opzioni spuntate
+    // Array non vuoto → spuntato → true, array vuoto/null → false
+    if (Array.isArray(value)) return value.length > 0;
+    return Boolean(value);
+  }
+
+  if (TEXT_TYPES.has(type)) {
+    return value ?? null;
+  }
+
+  // Tipo non gestito esplicitamente: ritorna as-is con warning
+  console.warn(`[${ENDPOINT}] WARN: tipo non gestito "${type}" per field="${label}", ritorno value grezzo`);
+  return value ?? null;
+}
+
+// ─── buildFieldGetter ─────────────────────────────────────────────────────────
+// Restituisce get(label) → valore estratto e loggato.
 function buildFieldGetter(fields) {
   const byLabel = {};
   for (const f of fields ?? []) {
@@ -48,27 +91,16 @@ function buildFieldGetter(fields) {
     const f = byLabel[label];
     if (!f) return null;
 
-    // Scelta singola / multipla con options
-    if (Array.isArray(f.options) && f.options.length > 0) {
-      const selected = f.options.filter((o) => o.isSelected);
-      if (selected.length === 1) return selected[0].text;
-      if (selected.length > 1) return selected.map((o) => o.text).join(', ');
-    }
-
-    // Checkbox booleana (consensi)
-    if (f.type === 'CHECKBOXES') {
-      if (typeof f.value === 'boolean') return f.value ? 'true' : 'false';
-      if (Array.isArray(f.value)) return f.value.length > 0 ? 'true' : 'false';
-    }
-
-    // Tutto il resto → valore grezzo come stringa
-    if (f.value == null) return null;
-    return String(f.value);
+    const extracted = extractFieldValue(f);
+    console.log(
+      `[${ENDPOINT}] Field "${label}" type=${f.type} ` +
+      `raw_value=${JSON.stringify(f.value)} extracted=${JSON.stringify(extracted)}`
+    );
+    return extracted;
   };
 }
 
 // ─── Phone normalization ──────────────────────────────────────────────────────
-// Target: E.164 italiano (+39XXXXXXXXXX)
 function normalizePhone(raw) {
   if (!raw) return null;
   let n = String(raw).replace(/[\s\-().]/g, '');
@@ -78,28 +110,29 @@ function normalizePhone(raw) {
 }
 
 // ─── Quiz score ───────────────────────────────────────────────────────────────
-// Max lordo ~105, cappato a 100. Valori definiti con il cliente.
+// Opera SEMPRE su stringhe di testo risolte, mai su UUID.
+// Max lordo ~105, cappato a 100.
 function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_auto, km_anno, budget_mensile, scadenza_noleggio }) {
   let score = 0;
 
   // tipo_cliente (8–12 pt)
-  if (tipo_cliente) {
+  if (tipo_cliente && typeof tipo_cliente === 'string') {
     if (tipo_cliente === 'Privato') score += 8;
-    else if (/P\.?IVA|partita ivа|partita iva/i.test(tipo_cliente)) score += 12;
+    else if (/P\.?IVA|partita\s*iva/i.test(tipo_cliente)) score += 12;
     else if (/aziend/i.test(tipo_cliente)) score += 12;
   }
 
   // ha_noleggio_in_corso (5–20 pt)
-  if (ha_noleggio_in_corso) {
+  if (ha_noleggio_in_corso && typeof ha_noleggio_in_corso === 'string') {
     const v = ha_noleggio_in_corso.toLowerCase();
     if (v.includes('scadenza')) score += 20;
     else if (v.includes('lontano')) score += 5;
     else if (v.includes('mai avuto')) score += 8;
-    else if (v.includes("so cos'è") || v.includes("non so cos")) score += 10;
+    else if (v.includes("so cos'è") || v.includes('non so cos')) score += 10;
   }
 
   // urgenza (3–25 pt)
-  if (urgenza) {
+  if (urgenza && typeof urgenza === 'string') {
     const v = urgenza.toLowerCase();
     if (v.includes('subito')) score += 25;
     else if (v.includes('1 e 3') || v.includes('1-3')) score += 18;
@@ -108,7 +141,7 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
   }
 
   // segmento_auto (5–15 pt)
-  if (segmento_auto) {
+  if (segmento_auto && typeof segmento_auto === 'string') {
     const v = segmento_auto.toLowerCase();
     if (v.includes('utilitaria')) score += 5;
     else if (v.includes('berlina')) score += 8;
@@ -120,7 +153,7 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
   if (km_anno) score += 5;
 
   // budget_mensile (3–20 pt)
-  if (budget_mensile) {
+  if (budget_mensile && typeof budget_mensile === 'string') {
     if (/fino a 300/i.test(budget_mensile)) score += 5;
     else if (/tra 300|300.+500/i.test(budget_mensile)) score += 10;
     else if (/tra 500|500.+800/i.test(budget_mensile)) score += 15;
@@ -128,8 +161,10 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
     else if (/non ho|senza budget/i.test(budget_mensile)) score += 3;
   }
 
-  // BONUS scadenza_noleggio (0 o +10)
-  if (scadenza_noleggio && /entro 1 mese/i.test(scadenza_noleggio)) score += 10;
+  // BONUS scadenza_noleggio (+10)
+  if (scadenza_noleggio && typeof scadenza_noleggio === 'string' && /entro 1 mese/i.test(scadenza_noleggio)) {
+    score += 10;
+  }
 
   return Math.min(100, score);
 }
@@ -137,10 +172,7 @@ function calcQuizScore({ tipo_cliente, ha_noleggio_in_corso, urgenza, segmento_a
 // ─── Handler ──────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   const timestamp = new Date().toISOString();
-  const log = (msg, data) =>
-    data !== undefined
-      ? console.log(`[${new Date().toISOString()}] [${ENDPOINT}] ${msg}`, data)
-      : console.log(`[${new Date().toISOString()}] [${ENDPOINT}] ${msg}`);
+  const log = (msg) => console.log(`[${new Date().toISOString()}] [${ENDPOINT}] ${msg}`);
 
   if (req.method !== 'POST') {
     log(`Metodo non consentito: ${req.method}`);
@@ -148,7 +180,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Verifica firma
+    // Log completo per debug (rimuovere in produzione stabile)
+    console.log(`[${ENDPOINT}] FULL PAYLOAD:`, JSON.stringify(req.body, null, 2));
+
     if (!verifySignature(req)) {
       log('Firma HMAC non valida — richiesta rifiutata');
       return res.status(401).json({ error: 'Unauthorized' });
@@ -157,7 +191,6 @@ export default async function handler(req, res) {
     const { eventType, data } = req.body ?? {};
     log(`Evento ricevuto: ${eventType}`);
 
-    // Submission parziali: logga e ignora (gestione retargeting futura)
     if (eventType === 'FORM_RESPONSE_PARTIAL') {
       log('Submission parziale — skip (retargeting non ancora implementato)');
       return res.status(200).json({ ok: true, ignored: true });
@@ -168,26 +201,28 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ignored: true });
     }
 
-    log(`Payload Tally ricevuto (formId: ${data?.formId})`);
+    log(`formId: ${data?.formId} — responseId: ${data?.responseId}`);
 
-    // ── Estrai campi ──────────────────────────────────────────────────────
+    // ── Estrai campi (UUID → testo) ───────────────────────────────────────
     const get = buildFieldGetter(data?.fields);
 
-    const tipo_cliente      = get("Sei un privato, hai partita IVA o sei un'azienda?");
-    const settore_attivita  = get('In che settore lavori?');
+    const tipo_cliente        = get("Sei un privato, hai partita IVA o sei un'azienda?");
+    const settore_attivita    = get('In che settore lavori?');
     const ha_noleggio_in_corso = get('Hai già un noleggio a lungo termine in corso?');
-    const scadenza_noleggio = get('Quando scade il tuo noleggio?');
-    const first_name        = get('Come ti chiami?');
-    const rawPhone          = get('Numero di telefono');
-    const email             = get('Email');
-    const consenso_privacy  = get('Acconsento al trattamento dei miei dati personali ai sensi del GDPR (privacy policy)');
-    const consenso_chiamate = get('Acconsento a essere contattato tramite chiamate automatizzate e SMS dal sistema AI di [nome concessionario]');
-    const consenso_marketing = get('Acconsento all\'invio di comunicazioni commerciali e promozionali');
-    const urgenza           = get('Quando ti servirebbe l\'auto?');
-    const segmento_auto     = get('Che tipo di auto stai cercando?');
-    const km_anno           = get('Quanti chilometri all\'anno percorri di solito?');
-    const budget_mensile    = get('Hai un budget mensile orientativo?');
-    const contatto_preferito = get('Come preferisci essere contattato per il preventivo?');
+    const scadenza_noleggio   = get('Quando scade il tuo noleggio?');
+    const first_name          = get('Come ti chiami?');
+    const rawPhone            = get('Numero di telefono');
+    const email               = get('Email');
+    const urgenza             = get("Quando ti servirebbe l'auto?");
+    const segmento_auto       = get('Che tipo di auto stai cercando?');
+    const km_anno             = get('Quanti chilometri all\'anno percorri di solito?');
+    const budget_mensile      = get('Hai un budget mensile orientativo?');
+    const contatto_preferito  = get('Come preferisci essere contattato per il preventivo?');
+
+    // Consensi: estratti come boolean (true/false), non stringa
+    const consenso_privacy    = get('Acconsento al trattamento dei miei dati personali ai sensi del GDPR (privacy policy)');
+    const consenso_chiamate   = get("Acconsento a essere contattato tramite chiamate automatizzate e SMS dal sistema AI di [nome concessionario]");
+    const consenso_marketing  = get("Acconsento all'invio di comunicazioni commerciali e promozionali");
 
     // ── Valida phone ──────────────────────────────────────────────────────
     const phone = normalizePhone(rawPhone);
@@ -198,32 +233,36 @@ export default async function handler(req, res) {
 
     log(`Lead: ${first_name ?? '(nome assente)'} — phone: ${phone}`);
 
-    // ── Calcola quiz_score ────────────────────────────────────────────────
+    // ── Calcola quiz_score su valori testuali risolti ─────────────────────
     const quiz_score = calcQuizScore({
       tipo_cliente, ha_noleggio_in_corso, urgenza,
       segmento_auto, km_anno, budget_mensile, scadenza_noleggio,
     });
-    log(`quiz_score calcolato: ${quiz_score}/100`);
+    log(`quiz_score: ${quiz_score}/100`);
 
-    // ── Upsert contatto GHL ───────────────────────────────────────────────
-    // Usa POST /contacts/upsert che crea o aggiorna per phone/email.
-    // customFields accetta il formato { key, field_value } con il fieldKey
-    // breve (senza prefisso "contact.") come restituito da GET /customFields.
+    // ── Componi customFields (skip se null, skip durata_mesi) ─────────────
+    // durata_mesi non è presente nel form Tally — non includere per evitare
+    // di sovrascrivere il placeholder "Es. 12" già visto in produzione.
     const customFields = [
-      tipo_cliente       && { key: 'tipo_cliente',       field_value: tipo_cliente },
-      settore_attivita   && { key: 'settore_attivita',   field_value: settore_attivita },
-      scadenza_noleggio  && { key: 'scadenza_noleggio',  field_value: scadenza_noleggio },
-      contatto_preferito && { key: 'contatto_preferito', field_value: contatto_preferito },
-      urgenza            && { key: 'urgenza',            field_value: urgenza },
-      segmento_auto      && { key: 'segmento_auto',      field_value: segmento_auto },
-      km_anno            && { key: 'km_anno',            field_value: km_anno },
-      budget_mensile     && { key: 'budget_mensile',     field_value: budget_mensile },
-      consenso_privacy   && { key: 'consenso_privacy',   field_value: consenso_privacy },
-      consenso_chiamate  && { key: 'consenso_chiamate',  field_value: consenso_chiamate },
-      consenso_marketing && { key: 'consenso_marketing', field_value: consenso_marketing },
-                           { key: 'quiz_score',          field_value: quiz_score },
+      tipo_cliente        != null && { key: 'tipo_cliente',        field_value: tipo_cliente },
+      settore_attivita    != null && { key: 'settore_attivita',    field_value: settore_attivita },
+      scadenza_noleggio   != null && { key: 'scadenza_noleggio',   field_value: scadenza_noleggio },
+      contatto_preferito  != null && { key: 'contatto_preferito',  field_value: contatto_preferito },
+      urgenza             != null && { key: 'urgenza',             field_value: urgenza },
+      segmento_auto       != null && { key: 'segmento_auto',       field_value: segmento_auto },
+      km_anno             != null && { key: 'km_anno',             field_value: km_anno },
+      budget_mensile      != null && { key: 'budget_mensile',      field_value: budget_mensile },
+      // Consensi come boolean (tipo Checkbox in GHL)
+      consenso_privacy    != null && { key: 'consenso_privacy',    field_value: consenso_privacy },
+      consenso_chiamate   != null && { key: 'consenso_chiamate',   field_value: consenso_chiamate },
+      consenso_marketing  != null && { key: 'consenso_marketing',  field_value: consenso_marketing },
+      // quiz_score sempre presente
+                                     { key: 'quiz_score',          field_value: quiz_score },
     ].filter(Boolean);
 
+    log(`customFields payload GHL: ${JSON.stringify(customFields)}`);
+
+    // ── Upsert contatto GHL ───────────────────────────────────────────────
     const upsertPayload = {
       locationId: process.env.GHL_LOCATION_ID,
       ...(first_name && { firstName: first_name }),
@@ -270,7 +309,7 @@ export default async function handler(req, res) {
       console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore SMS (non bloccante):`, smsErr.message);
     }
 
-    // ── Upstash: schedula Vapi call fallback ──────────────────────────────
+    // ── Upstash: schedula Vapi call fallback (TTL 600s) ───────────────────
     const redisKey = `vapi_pending:${phone}`;
     await redis.set(
       redisKey,
