@@ -23,6 +23,10 @@
     "api/webhook/hot-lead-handoff.js": {
       "memory": 128,
       "maxDuration": 30
+    },
+    "api/webhook/tally-submitted.js": {
+      "memory": 128,
+      "maxDuration": 30
     }
   }
 }
