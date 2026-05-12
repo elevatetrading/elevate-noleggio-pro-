@@ -1,8 +1,14 @@
 import twilio from 'twilio';
 import OpenAI from 'openai';
+import axios from 'axios';
 import { URLSearchParams } from 'url';
 import { Redis } from '@upstash/redis';
-import axios from 'axios';
+import {
+  findContactByPhone,
+  updateContactFields,
+  addContactTags,
+  setContactDnd,
+} from '../../lib/ghl.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'incoming-sms';
@@ -27,39 +33,90 @@ function parseOpenAiJson(content) {
   return null;
 }
 
-const CHAT_SETTER_PROMPT = `# RUOLO
-Sei Sara, assistente di AutoExperience (noleggio a lungo termine, Siracusa). Rispondi via SMS a un lead che ha compilato un quiz sul sito.
+// Restituisce data/ora corrente formattata per il prompt (Europe/Rome).
+function getRomeDateTime() {
+  const now = new Date();
+  const dateStr = new Intl.DateTimeFormat('it-IT', {
+    timeZone: 'Europe/Rome',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(now);
+  const timeStr = new Intl.DateTimeFormat('it-IT', {
+    timeZone: 'Europe/Rome',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(now);
+  return `${dateStr}, ore ${timeStr}`;
+}
+
+function buildSystemPrompt() {
+  const currentDateTime = getRomeDateTime();
+  return `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)
+
+# RUOLO
+Sei Sara, assistente di AutoExperience (noleggio a lungo termine, Siracusa). Rispondi via SMS a un lead che ha compilato un quiz sul sito o che ha ricevuto un SMS di recupero dopo una chiamata senza risposta.
 
 # OBIETTIVO
-Qualificare il lead in 4-5 messaggi raccogliendo: tipo cliente (privato o partita IVA), km/anno percorsi, tipo auto (city car/berlina/SUV/premium), urgenza. Se interessato e qualificato, proporre richiamo da un commerciale umano.
+Classificare l'intent del messaggio e rispondere in modo appropriato. Se il lead vuole essere richiamato, conferma l'orario. Se vuole qualificarsi via chat, raccogli: tipo cliente (privato o p.iva), km/anno, tipo auto (city car/berlina/SUV/premium), urgenza. Se non è interessato, chiudi cortesemente.
 
 # TONO E STILE SMS
 - Frasi brevi, max 2 per messaggio
 - Italiano semplice, mai formale-aulico
-- Mai usare paragrafi lunghi
 - Risposte da 1-3 righe massimo
 - Cordialità senza esagerazioni
 
 # REGOLE INVIOLABILI
 - MAI dare prezzi specifici. Se chiedono: "Non posso darti cifre precise via SMS, dipende da configurazione, durata e km. Te le farà sapere il commerciale in un preventivo personalizzato."
 - MAI inventare modelli auto, promozioni, o disponibilità
-- MAI promettere orari specifici di richiamo
 - Se chiede umano subito: "Certo, ti faccio richiamare. Posso solo chiederti nome e tipo di noleggio per girare la richiesta giusta?"
 - Se ostile: scusa breve, chiudi senza insistere
 - Se non interessato: ringrazia, chiudi
 
-# CHIUSURA
+# INTENT CLASSIFICATION
+Classifica ogni messaggio in una di queste categorie:
+
+**"schedule"** — il lead vuole essere richiamato in un momento specifico:
+  - "domani alle 15", "venerdì pomeriggio", "stasera dopo le 19", "chiamami il 14 maggio"
+  - "richiamatemi tra 2 ore", "mi va meglio domani mattina", "mi chiami nel pomeriggio"
+  - Se dice un'ora senza giorno: oggi se è nel futuro, domani se è già passata
+
+**"qualify"** — risponde a domande di Sara o chiede info specifiche su preventivo/durata/marche:
+  - "quanto costa una BMW serie 3?", "fate noleggio per p.iva?", "faccio circa 15000 km l'anno"
+
+**"rejection"** — non è interessato o vuole essere rimosso:
+  - "non sono interessato", "non chiamatemi più", "rimuovete il mio numero", "basta"
+
+**"info_only"** — richiesta generica senza intenzione chiara:
+  - "ditemi qualcosa", "come funziona", "che marche avete", "ciao"
+
+# REGOLE PARSING DATA/ORA (usa "Data/ora corrente" sopra come riferimento)
+- "oggi" → data odierna
+- "domani" → data odierna + 1 giorno
+- "dopodomani" → data odierna + 2 giorni
+- "lunedì/martedì/.../domenica prossimo/a" → prossima occorrenza (se oggi è già quel giorno, la settimana successiva)
+- "mattina" senza orario → 10:00; "pomeriggio" → 15:00; "sera" → 18:00
+- "alle 15", "alle tre", "alle 3 di pomeriggio" → ora esatta
+- Se orario ambiguo o impossibile: restituisci \`scheduled_datetime: null\` e chiedi chiarimento nella response
+- \`scheduled_datetime\` in formato ISO 8601 con offset Europe/Rome, es. "2026-05-13T15:00:00+02:00"
+
+# CHIUSURA QUALIFICA
 Quando hai info sufficienti: "Perfetto, ti faccio richiamare a breve da un commerciale per un preventivo personalizzato. Buona giornata!"
 
 # OUTPUT JSON
 Rispondi SEMPRE e SOLO con un oggetto JSON valido, senza markdown. Struttura:
 {
-  "response": "<il messaggio SMS da inviare al lead, max 3 righe>",
-  "intent_score": <0-100, quanto sembra deciso ad andare avanti>,
-  "qualifica_score": <0-100, quanto sta fornendo informazioni utili>,
-  "engagement_score": <0-100, quanto è ingaggiato nella conversazione>,
-  "ready_for_handoff": <true se serve passare subito al commerciale, false altrimenti>
+  "intent": "schedule" | "qualify" | "rejection" | "info_only",
+  "scheduled_datetime": "ISO 8601 string" | null,
+  "response": "<messaggio SMS da inviare al lead, max 3 righe>",
+  "intent_score": <0-100>,
+  "qualifica_score": <0-100>,
+  "engagement_score": <0-100>,
+  "ready_for_handoff": <true | false>
 }`;
+}
 
 export default async function handler(req, res) {
   const timestamp = new Date().toISOString();
@@ -70,6 +127,8 @@ export default async function handler(req, res) {
   }
 
   try {
+    console.log(`[${ENDPOINT}] RAW BODY:`, JSON.stringify(req.body));
+
     // Twilio invia application/x-www-form-urlencoded
     const raw = typeof req.body === 'string'
       ? Object.fromEntries(new URLSearchParams(req.body))
@@ -80,15 +139,15 @@ export default async function handler(req, res) {
 
     console.log(`[${timestamp}] [${ENDPOINT}] SMS da ${from}: "${incomingText}"`);
 
-    // Il lead sta interagendo via SMS: cancella l'eventuale chiamata Vapi schedulata
+    // Il lead sta interagendo via SMS — cancella eventuale chiamata Vapi pendente
     const deleted = await redis.del(`vapi_pending:${from}`);
     if (deleted) {
-      console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Cancelled scheduled Vapi call for ${from}`);
+      console.log(`[${ENDPOINT}] Cancelled scheduled Vapi call for ${from}`);
     }
 
-    // Segnala che il lead è attivo — blocca il fallback endpoint per 1h
-    await redis.set(`engaged:${from}`, '1', { ex: 3600 });
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Set engaged:${from} TTL 3600s`);
+    // Segnala che il lead è attivo — blocca fallback e recovery per 24h
+    await redis.set(`engaged:${from}`, '1', { ex: 86400 });
+    console.log(`[${ENDPOINT}] Set engaged:${from} TTL 86400s`);
 
     const twilioClient = twilio(
       process.env.TWILIO_ACCOUNT_SID,
@@ -111,57 +170,114 @@ export default async function handler(req, res) {
       }));
 
     const messages = [
-      { role: 'system', content: CHAT_SETTER_PROMPT },
+      { role: 'system', content: buildSystemPrompt() },
       ...history,
       { role: 'user', content: incomingText },
     ];
 
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Contesto: ${history.length} messaggi precedenti`);
+    console.log(`[${ENDPOINT}] Contesto: ${history.length} messaggi precedenti`);
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.6,
-      max_tokens: 300,
+      max_tokens: 350,
       messages,
     });
 
     const rawContent = completion.choices[0].message.content;
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Risposta OpenAI raw: ${rawContent}`);
+    console.log(`[${ENDPOINT}] OpenAI raw: ${rawContent}`);
 
-    // Parsing JSON — con fallback su testo puro se il formato non è valido
     const parsed = parseOpenAiJson(rawContent);
     const reply = parsed?.response ?? rawContent;
+    const intent = parsed?.intent ?? 'qualify';
+    const scheduledDatetime = parsed?.scheduled_datetime ?? null;
 
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Risposta SMS: "${reply}"`);
+    console.log(`[${ENDPOINT}] LLM response intent=${intent} scheduled_datetime=${scheduledDatetime} engagement_score=${parsed?.engagement_score ?? 'N/A'}`);
 
+    // Invia sempre la risposta SMS
     await twilioClient.messages.create({ body: reply, from: ourNumber, to: from });
-    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] SMS inviato a ${from}`);
+    console.log(`[${ENDPOINT}] SMS inviato a ${from}: "${reply}"`);
 
-    // Aggiorna score se il parsing è andato a buon fine
-    if (parsed && parsed.intent_score != null) {
-      console.log(
-        `[${new Date().toISOString()}] [${ENDPOINT}] Score: ` +
-        `intent=${parsed.intent_score} qualifica=${parsed.qualifica_score} ` +
-        `engagement=${parsed.engagement_score} handoff=${parsed.ready_for_handoff}`
-      );
-      try {
-        await axios.post(
-          internalUrl('/api/webhook/score-update'),
-          {
-            phone: from,
-            intent_score: parsed.intent_score,
-            qualifica_score: parsed.qualifica_score,
-            engagement_score: parsed.engagement_score,
-            ready_for_handoff: parsed.ready_for_handoff,
-          },
-          { timeout: 10000 }
-        );
-      } catch (e) {
-        console.warn(`[${new Date().toISOString()}] [${ENDPOINT}] Errore score-update (non bloccante):`, e.message);
+    // ── Logica per intent ──────────────────────────────────────────────────
+
+    if (intent === 'schedule') {
+      if (scheduledDatetime) {
+        const scheduledAt = new Date(scheduledDatetime);
+        if (!isNaN(scheduledAt.getTime())) {
+          const secondsUntil = Math.floor((scheduledAt.getTime() - Date.now()) / 1000);
+          const ttl = Math.max(3600, secondsUntil + 3600);
+          await redis.set(`scheduled_call:${from}`, scheduledDatetime, { ex: ttl });
+          console.log(`[${ENDPOINT}] Scheduled call set for ${from} at ${scheduledDatetime} (TTL ${ttl}s)`);
+
+          try {
+            const contact = await findContactByPhone(from);
+            if (contact) {
+              await Promise.all([
+                updateContactFields(contact.id, [{ key: 'next_contact_at', value: scheduledDatetime }]),
+                addContactTags(contact.id, ['scheduled_call_set', 'engaged_sms']),
+              ]);
+            }
+          } catch (e) {
+            console.warn(`[${ENDPOINT}] WARN: GHL schedule update failed: ${e.message}`);
+          }
+          console.log(`[${ENDPOINT}] Action taken: schedule_confirmed`);
+        } else {
+          console.warn(`[${ENDPOINT}] WARN: scheduled_datetime non valido ("${scheduledDatetime}") — trattato come null`);
+          console.log(`[${ENDPOINT}] Action taken: schedule_clarification_requested`);
+        }
+      } else {
+        // LLM ha restituito intent=schedule ma senza orario — ha già chiesto chiarimento
+        try {
+          const contact = await findContactByPhone(from);
+          if (contact) await addContactTags(contact.id, ['scheduling_in_progress']);
+        } catch (e) {
+          console.warn(`[${ENDPOINT}] WARN: GHL tag failed: ${e.message}`);
+        }
+        console.log(`[${ENDPOINT}] Action taken: schedule_clarification_requested`);
       }
+
+    } else if (intent === 'rejection') {
+      try {
+        const contact = await findContactByPhone(from);
+        if (contact) {
+          await addContactTags(contact.id, ['rejected_by_lead']);
+          await setContactDnd(contact.id);
+        }
+      } catch (e) {
+        console.warn(`[${ENDPOINT}] WARN: GHL rejection update failed: ${e.message}`);
+      }
+      await redis.del(`scheduled_call:${from}`);
+      console.log(`[${ENDPOINT}] Lead explicitly rejected, marking as DND`);
+      console.log(`[${ENDPOINT}] Action taken: rejection_handled`);
+
     } else {
-      console.warn(`[${new Date().toISOString()}] [${ENDPOINT}] JSON scoring non valido — skip score-update`);
+      // qualify o info_only — aggiorna score e triggera eventuale handoff
+      if (parsed && parsed.intent_score != null) {
+        console.log(
+          `[${ENDPOINT}] Score: ` +
+          `intent=${parsed.intent_score} qualifica=${parsed.qualifica_score} ` +
+          `engagement=${parsed.engagement_score} handoff=${parsed.ready_for_handoff}`
+        );
+        try {
+          await axios.post(
+            internalUrl('/api/webhook/score-update'),
+            {
+              phone: from,
+              intent_score: parsed.intent_score,
+              qualifica_score: parsed.qualifica_score,
+              engagement_score: parsed.engagement_score,
+              ready_for_handoff: parsed.ready_for_handoff,
+            },
+            { timeout: 10000 }
+          );
+        } catch (e) {
+          console.warn(`[${ENDPOINT}] Errore score-update (non bloccante): ${e.message}`);
+        }
+      } else {
+        console.warn(`[${ENDPOINT}] JSON scoring non valido — skip score-update`);
+      }
+      console.log(`[${ENDPOINT}] Action taken: qualify_${intent}`);
     }
 
     // TwiML vuoto richiesto da Twilio per confermare ricezione
