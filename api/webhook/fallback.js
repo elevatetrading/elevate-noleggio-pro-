@@ -3,6 +3,7 @@ import axios from 'axios';
 import { Redis } from '@upstash/redis';
 import { normalizePhone, isCallingHourAllowed } from '../../lib/channel-actions.js';
 import { getContact, addContactTags } from '../../lib/ghl.js';
+import { TTL_FALLBACK_DONE } from '../../lib/redis-config.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'fallback';
@@ -186,8 +187,8 @@ export default async function handler(req, res) {
     }
 
     // ── Step 8: Setta fallback_done per prevenire ri-esecuzione ──────────
-    await redis.set(`fallback_done:${phone}`, '1', { ex: 86400 });
-    log(`Redis fallback_done:${phone} set TTL 86400s`);
+    log(`Setting key fallback_done TTL=${TTL_FALLBACK_DONE}s`);
+    await redis.set(`fallback_done:${phone}`, '1', { ex: TTL_FALLBACK_DONE });
 
     // Aggiungi tag GHL (best effort, non blocca il flusso)
     try {

@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { Redis } from '@upstash/redis';
 import { findContactByPhone, updateContactFields } from '../../lib/ghl.js';
+import { TTL_HANDOFF_DONE } from '../../lib/redis-config.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'score-update';
@@ -52,7 +53,8 @@ export default async function handler(req, res) {
       const alreadyDone = await redis.get(`handoff_done:${phone}`);
       if (!alreadyDone) {
         // Segna subito per evitare doppie notifiche anche se la chiamata sotto fallisce
-        await redis.set(`handoff_done:${phone}`, '1', { ex: 86400 });
+        console.log(`[${timestamp}] [${ENDPOINT}] Setting key handoff_done TTL=${TTL_HANDOFF_DONE}s`);
+        await redis.set(`handoff_done:${phone}`, '1', { ex: TTL_HANDOFF_DONE });
         console.log(`[${timestamp}] [${ENDPOINT}] Trigger handoff per ${phone} (lead_score=${lead_score})`);
         try {
           await axios.post(

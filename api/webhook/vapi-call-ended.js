@@ -8,6 +8,7 @@ import {
   findOpportunity,
   moveOpportunityToHotLead,
 } from '../../lib/ghl.js';
+import { TTL_RECOVERY_SMS } from '../../lib/redis-config.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'vapi-call-ended';
@@ -222,9 +223,10 @@ export default async function handler(req, res) {
         console.error(`[${timestamp}] [${ENDPOINT}] ERROR SMS: ${e.message}`);
       }
 
-      // Redis: engaged 24h + anti-duplicato 1h
+      // Redis: engaged fisso 24h + anti-duplicato configurabile
       await redis.set(`engaged:${phone}`, '1', { ex: 86400 });
-      await redis.set(`recovery_sms_sent:${phone}`, '1', { ex: 3600 });
+      console.log(`[${ENDPOINT}] Setting key recovery_sms_sent TTL=${TTL_RECOVERY_SMS}s`);
+      await redis.set(`recovery_sms_sent:${phone}`, '1', { ex: TTL_RECOVERY_SMS });
 
       // GHL: tag + custom fields (best effort, non bloccano il flusso)
       if (contactId) {
