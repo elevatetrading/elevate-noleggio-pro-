@@ -79,17 +79,39 @@ const HOT_OUTCOMES = new Set(['interested', 'human_requested', 'booked']);
 
 const EXTRACTION_PROMPT = `Sei un estrattore di dati strutturati. Analizza la trascrizione di una chiamata tra Sara (assistente AI di AutoExperience, noleggio a lungo termine) e un potenziale cliente.
 
-Estrai le seguenti informazioni SE presenti nella trascrizione. Se un campo non è menzionato o non è chiaro, restituisci null per quel campo.
+# CAMPO OBBLIGATORIO: ai_call_summary
+Scrivi SEMPRE 2-3 frasi che riassumono la chiamata. MAI stringa vuota o null.
+Anche se la conversazione è stata brevissima: descrivi cosa è successo (es. "Il lead ha risposto brevemente senza fornire dettagli sul noleggio. Non ha espresso interesse esplicito né urgenza.").
 
-Campi da estrarre:
-- tipo_cliente: "privato" | "p.iva" | null
-- km_anno: numero intero (es. 15000) | null — i km percorsi annualmente
-- segmento_auto: "city_car" | "berlina" | "suv" | "premium" | null
-- urgenza: "immediata" | "entro_3_mesi" | "esplorativa" | null
-- durata_mesi: numero intero (es. 36, 48, 60) | null — durata preferita del contratto
+# CAMPI DI QUALIFICA (restituisci null se non menzionato)
 
+tipo_cliente — SOLO questi valori esatti:
+  "privato" | "p.iva" | null
+
+km_anno — numero intero oppure null (es. 15000)
+
+segmento_auto — SOLO questi valori esatti:
+  "city_car" | "berlina" | "suv" | "premium" | null
+  Mai valori diversi (es. mai "SUV", mai "city car", mai "berlina/suv").
+
+urgenza — SOLO questi valori esatti: "1 mese" | "3 mesi" | "6 mesi" | "valutando"
+  Mapping obbligatorio:
+  → "subito" / "immediata" / "immediatamente" / "ora" / "presto" / "appena possibile" / "entro un mese" / "tra qualche settimana" → "1 mese"
+  → "due-tre mesi" / "dopo l'estate" / "entro tre mesi" → "3 mesi"
+  → "quattro-sei mesi" / "verso fine anno" / "entro sei mesi" → "6 mesi"
+  → "non so" / "sto valutando" / "vediamo" / "in futuro" / nessuna tempistica esplicita → "valutando"
+  MAI usare altri valori come "immediata", "entro_3_mesi", "esplorativa".
+
+durata_mesi — numero intero oppure null (es. 36, 48, 60)
+
+# SCORE (valori interi 0-100, OBBLIGATORI, mai null)
+intent_score: quanto il lead sembra deciso ad andare avanti con il noleggio
+qualifica_score: quante informazioni utili ha fornito (tipo cliente, km, auto, durata)
+engagement_score: quanto è stato collaborativo e interessato durante la chiamata
+
+# OUTPUT
 Rispondi SOLO con un oggetto JSON valido, senza markdown, senza spiegazioni:
-{"tipo_cliente": ..., "km_anno": ..., "segmento_auto": ..., "urgenza": ..., "durata_mesi": ...}`;
+{"ai_call_summary": "...", "tipo_cliente": ..., "km_anno": ..., "segmento_auto": ..., "urgenza": ..., "durata_mesi": ..., "intent_score": ..., "qualifica_score": ..., "engagement_score": ...}`;
 
 function buildTranscriptString(messages) {
   if (!Array.isArray(messages)) return '';
@@ -314,7 +336,7 @@ export default async function handler(req, res) {
           const completion = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             temperature: 0,
-            max_tokens: 150,
+            max_tokens: 300,
             messages: [
               { role: 'system', content: EXTRACTION_PROMPT },
               { role: 'user', content: transcriptString },
@@ -324,6 +346,7 @@ export default async function handler(req, res) {
           const parsed = parseJsonSafe(raw);
           if (parsed) {
             extracted = parsed;
+            console.log(`[${ENDPOINT}] LLM raw JSON: ${JSON.stringify(parsed)}`);
             console.log(
               `[${ENDPOINT}] LLM extraction OK: tipo_cliente=${extracted.tipo_cliente} ` +
               `km_anno=${extracted.km_anno} segmento=${extracted.segmento_auto} ` +
@@ -337,6 +360,13 @@ export default async function handler(req, res) {
         }
       }
 
+      // Calcola lead_score da score LLM (formula identica a score-update.js)
+      const intentScore    = Number(extracted.intent_score    ?? 0);
+      const qualificaScore = Number(extracted.qualifica_score ?? 0);
+      const engagementScore = Number(extracted.engagement_score ?? 0);
+      const computedLeadScore = Math.round(0.4 * intentScore + 0.4 * qualificaScore + 0.2 * engagementScore);
+      console.log(`[${ENDPOINT}] LLM scores: intent=${intentScore} qualifica=${qualificaScore} engagement=${engagementScore} → lead_score=${computedLeadScore}`);
+
       // Campi già popolati nel contatto GHL (da quiz o interazioni precedenti)
       const existingKeys = new Set(
         (contact.customFields ?? [])
@@ -344,13 +374,15 @@ export default async function handler(req, res) {
           .map((f) => f.key ?? f.id)
       );
 
-      // Costruisce la lista dei campi da scrivere
+      // Sempre sovrascritti: ai_call_summary (dal LLM, fallback a Vapi), ai_call_outcome, lead_score
+      const callSummary = (extracted.ai_call_summary ?? '').trim() || summary;
       const fieldsToWrite = [
-        { key: 'ai_call_summary', value: summary },
+        { key: 'ai_call_summary', value: callSummary },
         { key: 'ai_call_outcome', value: outcome },
+        { key: 'lead_score',      value: String(computedLeadScore) },
       ];
 
-      let written = 2;
+      let written = fieldsToWrite.length;
       let preserved = 0;
       for (const key of STRUCT_KEYS) {
         const val = extracted[key];
@@ -368,9 +400,8 @@ export default async function handler(req, res) {
       console.log(`[${ENDPOINT}] GHL custom fields updated: ${written} campi scritti, ${preserved} preservati`);
 
       // ── Hot-lead handoff ──────────────────────────────────────────────────
-      const leadScore = Number(structuredData?.lead_score ?? 0);
       const sdOutcome = structuredData?.outcome ?? '';
-      const isHot = HOT_OUTCOMES.has(sdOutcome) || leadScore >= 70;
+      const isHot = HOT_OUTCOMES.has(sdOutcome) || computedLeadScore >= 70;
 
       if (isHot) {
         const alreadyDone = await redis.get(`handoff_done:${phone}`);
