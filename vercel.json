@@ -35,6 +35,10 @@
     "api/webhook/fallback.js": {
       "memory": 128,
       "maxDuration": 30
+    },
+    "api/webhook/execute-scheduled-call.js": {
+      "memory": 128,
+      "maxDuration": 30
     }
   }
 }

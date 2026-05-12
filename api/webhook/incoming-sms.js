@@ -19,6 +19,18 @@ function internalUrl(path) {
   return `http://localhost:3000${path}`;
 }
 
+// Parole/frasi che indicano disdetta esplicita di una chiamata schedulata.
+const CANCELLATION_KEYWORDS = [
+  'non mi va più', 'non mi va piu', 'annulla', 'annullare', 'disdici', 'disdire',
+  'non mi chiamare', 'non richiamarmi', 'cancella la chiamata', 'non voglio essere chiamato',
+  'rimanda la chiamata', 'spostiamo la chiamata',
+];
+
+function hasCancellationKeyword(text) {
+  const lower = (text ?? '').toLowerCase();
+  return CANCELLATION_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
 // Parser robusto per la risposta JSON di OpenAI (gestisce markdown code block)
 function parseOpenAiJson(content) {
   try { return JSON.parse(content); } catch {}
@@ -199,6 +211,14 @@ export default async function handler(req, res) {
     await twilioClient.messages.create({ body: reply, from: ourNumber, to: from });
     console.log(`[${ENDPOINT}] SMS inviato a ${from}: "${reply}"`);
 
+    // Cancella chiamata schedulata se il lead la disdice (qualsiasi intent)
+    if (intent === 'rejection' || hasCancellationKeyword(incomingText)) {
+      const cancelledCount = await redis.del(`scheduled_call:${from}`);
+      if (cancelledCount) {
+        console.log(`[incoming-sms] Scheduled call CANCELLED for ${from} due to lead message`);
+      }
+    }
+
     // ── Logica per intent ──────────────────────────────────────────────────
 
     if (intent === 'schedule') {
@@ -247,7 +267,6 @@ export default async function handler(req, res) {
       } catch (e) {
         console.warn(`[${ENDPOINT}] WARN: GHL rejection update failed: ${e.message}`);
       }
-      await redis.del(`scheduled_call:${from}`);
       console.log(`[${ENDPOINT}] Lead explicitly rejected, marking as DND`);
       console.log(`[${ENDPOINT}] Action taken: rejection_handled`);
 
