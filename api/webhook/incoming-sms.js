@@ -20,6 +20,13 @@ function internalUrl(path) {
   return `http://localhost:3000${path}`;
 }
 
+// URL fisso di produzione per callback QStash — NON usare VERCEL_URL (punta al preview deploy).
+function qstashCallbackUrl(path) {
+  if (process.env.PUBLIC_BASE_URL) return `${process.env.PUBLIC_BASE_URL}${path}`;
+  console.warn(`[incoming-sms] WARN: PUBLIC_BASE_URL non definita — uso URL hardcoded produzione`);
+  return `https://elevate-noleggio-pro.vercel.app${path}`;
+}
+
 // Parole/frasi che indicano disdetta esplicita di una chiamata schedulata.
 const CANCELLATION_KEYWORDS = [
   'non mi va più', 'non mi va piu', 'annulla', 'annullare', 'disdici', 'disdire',
@@ -260,7 +267,7 @@ export default async function handler(req, res) {
           if (contactId) {
             try {
               const unixTimestamp = Math.floor(scheduledAt.getTime() / 1000);
-              const targetUrl = internalUrl('/api/webhook/execute-scheduled-call');
+              const targetUrl = qstashCallbackUrl('/api/webhook/execute-scheduled-call');
               const messageId = await schedulePost(targetUrl, { phone: from, contact_id: contactId }, unixTimestamp);
               const msgTtl = Math.max(3600, secondsUntil + 3600);
               await redis.set(`qstash_message_id:${from}`, messageId, { ex: msgTtl });
