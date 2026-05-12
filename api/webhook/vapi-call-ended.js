@@ -12,39 +12,31 @@ import {
 const redis = Redis.fromEnv();
 const ENDPOINT = 'vapi-call-ended';
 
-// endedReason che indicano che il lead non ha risposto → recovery SMS
-const NO_ANSWER_REASONS = new Set([
+const NO_INTERACTION_REASONS = new Set([
   'customer-did-not-answer',
   'customer-busy',
-  'voicemail',
-  'no-answer',
   'rejected',
-  'busy',
+  'no-answer',
+  'call-rejected',
+  'voicemail',
 ]);
 
-// endedReason che indicano una chiamata conclusa normalmente
-const COMPLETED_REASONS = new Set([
-  'customer-ended-call',
-  'assistant-ended-call',
-  'silence-timed-out',
-  'max-duration-exceeded',
-  'hangup',
-  'completed',
-]);
+const VOICEMAIL_KEYWORDS = [
+  'segnale acustico',
+  'lasci un messaggio',
+  'lasciare un messaggio',
+  'casella vocale',
+  'voicemail',
+  'segreteria',
+  'non disponibile in questo momento',
+];
 
-const REASON_TO_OUTCOME = {
-  'customer-ended-call': 'completed',
-  'assistant-ended-call': 'completed',
-  'silence-timed-out': 'completed',
-  'max-duration-exceeded': 'completed',
-  'customer-did-not-answer': 'no_answer',
-  'customer-busy': 'no_answer',
-  'voicemail': 'voicemail',
-  'no-answer': 'no_answer',
-  'rejected': 'no_answer',
-  'busy': 'no_answer',
-  'failed': 'failed',
-};
+function shouldSendRecovery(endedReason, transcript) {
+  if (NO_INTERACTION_REASONS.has(endedReason)) return true;
+  if (endedReason === 'silence-timed-out') return true;
+  const lower = (transcript ?? '').toLowerCase();
+  return VOICEMAIL_KEYWORDS.some((kw) => lower.includes(kw));
+}
 
 const HOT_OUTCOMES = new Set(['interested', 'human_requested', 'booked']);
 
@@ -129,9 +121,14 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
     }
 
-    // ── RAMO NO-ANSWER — recovery SMS ─────────────────────────────────────
-    if (NO_ANSWER_REASONS.has(endedReason)) {
-      console.log(`[${timestamp}] [${ENDPOINT}] No-answer branch — reason: ${endedReason}`);
+    const hasVoicemailKeyword = VOICEMAIL_KEYWORDS.some((kw) => (transcript ?? '').toLowerCase().includes(kw));
+    const recovery = shouldSendRecovery(endedReason, transcript);
+    const outcome = recovery ? 'no_answer_effective' : 'completed_normally';
+    console.log(`[${ENDPOINT}] Classification: endedReason=${endedReason} hasVoicemailKeyword=${hasVoicemailKeyword} outcome=${outcome}`);
+
+    // ── RAMO RECOVERY — lead non ha avuto interazione vocale reale ────────
+    if (recovery) {
+      console.log(`[${ENDPOINT}] Recovery SMS WILL be sent`);
 
       // Idempotenza: blocca doppi invii (Vapi può mandare l'evento 2-3 volte)
       const alreadySent = await redis.get(`recovery_sms_sent:${phone}`);
@@ -198,9 +195,9 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'recovery_sms_sent' });
     }
 
-    // ── RAMO CHIAMATA COMPLETATA — logica esistente invariata ─────────────
-    if (COMPLETED_REASONS.has(endedReason)) {
-      const outcome = structuredData?.outcome ?? REASON_TO_OUTCOME[endedReason] ?? 'completed';
+    // ── RAMO CONVERSAZIONE REALE — aggiornamento GHL + hot-lead handoff ──
+    {
+      console.log(`[${ENDPOINT}] Skipping recovery (real conversation occurred)`);
       console.log(`[${timestamp}] [${ENDPOINT}] Call completed normally, endedReason=${endedReason} outcome=${outcome}`);
       console.log(`[${timestamp}] [${ENDPOINT}] Summary: ${summary}`);
       console.log(`[${timestamp}] [${ENDPOINT}] Transcript (${transcript.length} chars)`);
@@ -220,7 +217,8 @@ export default async function handler(req, res) {
       console.log(`[${timestamp}] [${ENDPOINT}] Custom fields GHL aggiornati`);
 
       const leadScore = Number(structuredData?.lead_score ?? 0);
-      const isHot = HOT_OUTCOMES.has(outcome) || leadScore >= 70;
+      const sdOutcome = structuredData?.outcome ?? '';
+      const isHot = HOT_OUTCOMES.has(sdOutcome) || leadScore >= 70;
 
       if (isHot) {
         const alreadyDone = await redis.get(`handoff_done:${phone}`);
@@ -247,10 +245,6 @@ export default async function handler(req, res) {
 
       return res.status(200).json({ ok: true, action: 'call_completed_normally' });
     }
-
-    // ── RAMO FALLBACK — endedReason imprevisto (es. errori interni Vapi) ──
-    console.warn(`[${timestamp}] [${ENDPOINT}] WARN: endedReason non gestito "${endedReason}" — skip`);
-    return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
 
   } catch (err) {
     const errTs = new Date().toISOString();
