@@ -9,6 +9,7 @@ import {
   addContactTags,
   setContactDnd,
 } from '../../lib/ghl.js';
+import { schedulePost, cancelMessage } from '../../lib/qstash.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'incoming-sms';
@@ -217,6 +218,17 @@ export default async function handler(req, res) {
       if (cancelledCount) {
         console.log(`[incoming-sms] Scheduled call CANCELLED for ${from} due to lead message`);
       }
+      // Cancella anche il messaggio QStash se già schedulato
+      const qstashMsgId = await redis.get(`qstash_message_id:${from}`);
+      if (qstashMsgId) {
+        try {
+          await cancelMessage(qstashMsgId);
+          console.log(`[incoming-sms] QStash message cancelled: messageId=${qstashMsgId}`);
+        } catch (e) {
+          console.warn(`[incoming-sms] WARN: QStash cancel failed for messageId=${qstashMsgId}: ${e.message}`);
+        }
+        await redis.del(`qstash_message_id:${from}`);
+      }
     }
 
     // ── Logica per intent ──────────────────────────────────────────────────
@@ -230,9 +242,11 @@ export default async function handler(req, res) {
           await redis.set(`scheduled_call:${from}`, scheduledDatetime, { ex: ttl });
           console.log(`[${ENDPOINT}] Scheduled call set for ${from} at ${scheduledDatetime} (TTL ${ttl}s)`);
 
+          let contactId = null;
           try {
             const contact = await findContactByPhone(from);
             if (contact) {
+              contactId = contact.id;
               await Promise.all([
                 updateContactFields(contact.id, [{ key: 'next_contact_at', value: scheduledDatetime }]),
                 addContactTags(contact.id, ['scheduled_call_set', 'engaged_sms']),
@@ -241,6 +255,23 @@ export default async function handler(req, res) {
           } catch (e) {
             console.warn(`[${ENDPOINT}] WARN: GHL schedule update failed: ${e.message}`);
           }
+
+          // Schedula via QStash per chiamare il lead al datetime esatto
+          if (contactId) {
+            try {
+              const unixTimestamp = Math.floor(scheduledAt.getTime() / 1000);
+              const targetUrl = internalUrl('/api/webhook/execute-scheduled-call');
+              const messageId = await schedulePost(targetUrl, { phone: from, contact_id: contactId }, unixTimestamp);
+              const msgTtl = Math.max(3600, secondsUntil + 3600);
+              await redis.set(`qstash_message_id:${from}`, messageId, { ex: msgTtl });
+              console.log(`[incoming-sms] QStash scheduled message_id=${messageId} for_datetime=${scheduledDatetime} unix=${unixTimestamp}`);
+            } catch (e) {
+              console.warn(`[${ENDPOINT}] WARN: QStash scheduling failed: ${e.message}`);
+            }
+          } else {
+            console.warn(`[${ENDPOINT}] WARN: contact_id non disponibile — QStash scheduling saltato`);
+          }
+
           console.log(`[${ENDPOINT}] Action taken: schedule_confirmed`);
         } else {
           console.warn(`[${ENDPOINT}] WARN: scheduled_datetime non valido ("${scheduledDatetime}") — trattato come null`);
