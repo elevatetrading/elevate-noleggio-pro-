@@ -1,5 +1,6 @@
 import twilio from 'twilio';
 import axios from 'axios';
+import OpenAI from 'openai';
 import { Redis } from '@upstash/redis';
 import {
   findContactByPhone,
@@ -75,6 +76,45 @@ function isOnlyGreetings(text) {
 }
 
 const HOT_OUTCOMES = new Set(['interested', 'human_requested', 'booked']);
+
+const EXTRACTION_PROMPT = `Sei un estrattore di dati strutturati. Analizza la trascrizione di una chiamata tra Sara (assistente AI di AutoExperience, noleggio a lungo termine) e un potenziale cliente.
+
+Estrai le seguenti informazioni SE presenti nella trascrizione. Se un campo non è menzionato o non è chiaro, restituisci null per quel campo.
+
+Campi da estrarre:
+- tipo_cliente: "privato" | "p.iva" | null
+- km_anno: numero intero (es. 15000) | null — i km percorsi annualmente
+- segmento_auto: "city_car" | "berlina" | "suv" | "premium" | null
+- urgenza: "immediata" | "entro_3_mesi" | "esplorativa" | null
+- durata_mesi: numero intero (es. 36, 48, 60) | null — durata preferita del contratto
+
+Rispondi SOLO con un oggetto JSON valido, senza markdown, senza spiegazioni:
+{"tipo_cliente": ..., "km_anno": ..., "segmento_auto": ..., "urgenza": ..., "durata_mesi": ...}`;
+
+function buildTranscriptString(messages) {
+  if (!Array.isArray(messages)) return '';
+  return messages
+    .filter((m) => m?.role && (m?.message ?? m?.content ?? '').trim().length > 0)
+    .map((m) => {
+      const role = USER_ROLES.has(m.role) ? 'Cliente' : 'Sara';
+      const text = (m.message ?? m.content ?? '').trim();
+      return `${role}: ${text}`;
+    })
+    .join('\n');
+}
+
+function parseJsonSafe(content) {
+  try { return JSON.parse(content); } catch {}
+  try {
+    const clean = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    return JSON.parse(clean);
+  } catch {}
+  try {
+    const match = content.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+  } catch {}
+  return null;
+}
 
 function internalUrl(path) {
   if (process.env.BASE_URL) return `${process.env.BASE_URL}${path}`;
@@ -263,12 +303,71 @@ export default async function handler(req, res) {
 
       console.log(`[${timestamp}] [${ENDPOINT}] Contatto GHL: ${contact.id} (${contact.firstName ?? phone})`);
 
-      await updateContactFields(contact.id, [
+      // ── Estrazione strutturata qualifica via LLM ─────────────────────────
+      const STRUCT_KEYS = ['tipo_cliente', 'km_anno', 'segmento_auto', 'urgenza', 'durata_mesi'];
+      let extracted = {};
+
+      const transcriptString = buildTranscriptString(artifactMessages);
+      if (transcriptString.length > 0) {
+        try {
+          const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            temperature: 0,
+            max_tokens: 150,
+            messages: [
+              { role: 'system', content: EXTRACTION_PROMPT },
+              { role: 'user', content: transcriptString },
+            ],
+          });
+          const raw = completion.choices[0].message.content;
+          const parsed = parseJsonSafe(raw);
+          if (parsed) {
+            extracted = parsed;
+            console.log(
+              `[${ENDPOINT}] LLM extraction OK: tipo_cliente=${extracted.tipo_cliente} ` +
+              `km_anno=${extracted.km_anno} segmento=${extracted.segmento_auto} ` +
+              `urgenza=${extracted.urgenza} durata=${extracted.durata_mesi}`
+            );
+          } else {
+            console.warn(`[${ENDPOINT}] WARN: LLM extraction parse failed — raw: ${raw}`);
+          }
+        } catch (e) {
+          console.warn(`[${ENDPOINT}] WARN: LLM extraction failed: ${e.message}`);
+        }
+      }
+
+      // Campi già popolati nel contatto GHL (da quiz o interazioni precedenti)
+      const existingKeys = new Set(
+        (contact.customFields ?? [])
+          .filter((f) => f.value !== null && f.value !== '' && f.value !== undefined)
+          .map((f) => f.key ?? f.id)
+      );
+
+      // Costruisce la lista dei campi da scrivere
+      const fieldsToWrite = [
         { key: 'ai_call_summary', value: summary },
         { key: 'ai_call_outcome', value: outcome },
-      ]);
-      console.log(`[${timestamp}] [${ENDPOINT}] Custom fields GHL aggiornati`);
+      ];
 
+      let written = 2;
+      let preserved = 0;
+      for (const key of STRUCT_KEYS) {
+        const val = extracted[key];
+        if (val === null || val === undefined) continue;
+        if (existingKeys.has(key)) {
+          preserved++;
+          console.log(`[${ENDPOINT}] Preserve existing GHL field: ${key}`);
+        } else {
+          fieldsToWrite.push({ key, value: String(val) });
+          written++;
+        }
+      }
+
+      await updateContactFields(contact.id, fieldsToWrite);
+      console.log(`[${ENDPOINT}] GHL custom fields updated: ${written} campi scritti, ${preserved} preservati`);
+
+      // ── Hot-lead handoff ──────────────────────────────────────────────────
       const leadScore = Number(structuredData?.lead_score ?? 0);
       const sdOutcome = structuredData?.outcome ?? '';
       const isHot = HOT_OUTCOMES.has(sdOutcome) || leadScore >= 70;
