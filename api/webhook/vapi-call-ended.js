@@ -12,7 +12,7 @@ import {
 const redis = Redis.fromEnv();
 const ENDPOINT = 'vapi-call-ended';
 
-const NO_INTERACTION_REASONS = new Set([
+const NO_ANSWER_REASONS = new Set([
   'customer-did-not-answer',
   'customer-busy',
   'rejected',
@@ -29,13 +29,35 @@ const VOICEMAIL_KEYWORDS = [
   'voicemail',
   'segreteria',
   'non disponibile in questo momento',
+  'registra il tuo messaggio',
+  'after the tone',
 ];
 
-function shouldSendRecovery(endedReason, transcript) {
-  if (NO_INTERACTION_REASONS.has(endedReason)) return true;
-  if (endedReason === 'silence-timed-out') return true;
-  const lower = (transcript ?? '').toLowerCase();
+const USER_ROLES = new Set(['user', 'customer']);
+
+function countSignificantUserMessages(messages) {
+  if (!Array.isArray(messages)) return 0;
+  return messages.filter((msg) => {
+    if (!USER_ROLES.has(msg?.role)) return false;
+    const text = (msg?.message ?? msg?.content ?? '').trim();
+    return text.length >= 2 && /[\p{L}\p{N}]/u.test(text);
+  }).length;
+}
+
+function hasVoicemailKeyword(text) {
+  const lower = (text ?? '').toLowerCase();
   return VOICEMAIL_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+// Real conversation only if ALL 3 conditions hold:
+//   1. ≥1 significant user message in artifact
+//   2. no voicemail keywords in transcript
+//   3. endedReason not in explicit no-answer set
+function shouldSendRecovery(endedReason, transcript, artifactMessages) {
+  if (NO_ANSWER_REASONS.has(endedReason)) return true;
+  if (hasVoicemailKeyword(transcript)) return true;
+  if (countSignificantUserMessages(artifactMessages) < 1) return true;
+  return false;
 }
 
 const HOT_OUTCOMES = new Set(['interested', 'human_requested', 'booked']);
@@ -114,6 +136,8 @@ export default async function handler(req, res) {
       'message.analysis.structuredData', 'analysis.structuredData', 'structuredData'
     ) ?? {};
 
+    const artifactMessages = body.message?.artifact?.messages ?? [];
+
     console.log(`[${timestamp}] [${ENDPOINT}] Fine chiamata — phone: ${phone}, reason: ${endedReason}`);
 
     if (!phone) {
@@ -121,10 +145,13 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
     }
 
-    const hasVoicemailKeyword = VOICEMAIL_KEYWORDS.some((kw) => (transcript ?? '').toLowerCase().includes(kw));
-    const recovery = shouldSendRecovery(endedReason, transcript);
+    const userMsgCount = countSignificantUserMessages(artifactMessages);
+    const vk = hasVoicemailKeyword(transcript);
+    console.log(`[${ENDPOINT}] Transcript analysis: userMessages=${userMsgCount} hasVoicemailKeyword=${vk} endedReason=${endedReason}`);
+
+    const recovery = shouldSendRecovery(endedReason, transcript, artifactMessages);
     const outcome = recovery ? 'no_answer_effective' : 'completed_normally';
-    console.log(`[${ENDPOINT}] Classification: endedReason=${endedReason} hasVoicemailKeyword=${hasVoicemailKeyword} outcome=${outcome}`);
+    console.log(`[${ENDPOINT}] Classification: outcome=${outcome}`);
 
     // ── RAMO RECOVERY — lead non ha avuto interazione vocale reale ────────
     if (recovery) {
