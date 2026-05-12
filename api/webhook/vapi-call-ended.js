@@ -35,13 +35,24 @@ const VOICEMAIL_KEYWORDS = [
 
 const USER_ROLES = new Set(['user', 'customer']);
 
-function countSignificantUserMessages(messages) {
-  if (!Array.isArray(messages)) return 0;
-  return messages.filter((msg) => {
-    if (!USER_ROLES.has(msg?.role)) return false;
+// Single-word tokens covering all Italian greeting/opener/filler phrases.
+const GREETING_TOKENS = new Set([
+  'pronto', 'sì', 'si', 'sono', 'io', 'chi', 'parla', 'è', 'sei',
+  'salve', 'ciao', 'buongiorno', 'buona', 'giornata', 'buonasera',
+  'sera', 'pomeriggio', 'buon', 'dimmi', 'dica', 'mi',
+  'mh', 'eh', 'ah', 'uhm',
+]);
+
+// Returns concatenated text of significant user messages + count.
+function analyzeUserMessages(messages) {
+  if (!Array.isArray(messages)) return { text: '', count: 0 };
+  const parts = [];
+  for (const msg of messages) {
+    if (!USER_ROLES.has(msg?.role)) continue;
     const text = (msg?.message ?? msg?.content ?? '').trim();
-    return text.length >= 2 && /[\p{L}\p{N}]/u.test(text);
-  }).length;
+    if (text.length >= 2 && /[\p{L}\p{N}]/u.test(text)) parts.push(text);
+  }
+  return { text: parts.join(' '), count: parts.length };
 }
 
 function hasVoicemailKeyword(text) {
@@ -49,15 +60,17 @@ function hasVoicemailKeyword(text) {
   return VOICEMAIL_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-// Real conversation only if ALL 3 conditions hold:
-//   1. ≥1 significant user message in artifact
-//   2. no voicemail keywords in transcript
-//   3. endedReason not in explicit no-answer set
-function shouldSendRecovery(endedReason, transcript, artifactMessages) {
-  if (NO_ANSWER_REASONS.has(endedReason)) return true;
-  if (hasVoicemailKeyword(transcript)) return true;
-  if (countSignificantUserMessages(artifactMessages) < 1) return true;
-  return false;
+// Returns true if every word in text is a known Italian greeting/opener/filler.
+function isOnlyGreetings(text) {
+  if (!text) return true;
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter((t) => t.length > 0);
+  return tokens.length === 0 || tokens.every((t) => GREETING_TOKENS.has(t));
 }
 
 const HOT_OUTCOMES = new Set(['interested', 'human_requested', 'booked']);
@@ -145,11 +158,22 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
     }
 
-    const userMsgCount = countSignificantUserMessages(artifactMessages);
+    const { text: userText, count: userMsgCount } = analyzeUserMessages(artifactMessages);
     const vk = hasVoicemailKeyword(transcript);
-    console.log(`[${ENDPOINT}] Transcript analysis: userMessages=${userMsgCount} hasVoicemailKeyword=${vk} endedReason=${endedReason}`);
+    const onlyGreetings = isOnlyGreetings(userText);
+    console.log(`[${ENDPOINT}] User transcript: "${userText}" (length=${userText.length}, onlyGreetings=${onlyGreetings})`);
 
-    const recovery = shouldSendRecovery(endedReason, transcript, artifactMessages);
+    // Real conversation only if ALL 4 conditions hold:
+    //   1. userText.length >= 15 OR msgCount >= 2
+    //   2. user transcript is not only greetings/openers
+    //   3. no voicemail keywords in transcript
+    //   4. endedReason not in explicit no-answer set
+    const recovery =
+      NO_ANSWER_REASONS.has(endedReason) ||
+      vk ||
+      (userText.length < 15 && userMsgCount < 2) ||
+      onlyGreetings;
+
     const outcome = recovery ? 'no_answer_effective' : 'completed_normally';
     console.log(`[${ENDPOINT}] Classification: outcome=${outcome}`);
 
