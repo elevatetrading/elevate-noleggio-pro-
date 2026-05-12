@@ -4,6 +4,14 @@ import { Redis } from '@upstash/redis';
 const redis = Redis.fromEnv();
 const ENDPOINT = 'initiate-call';
 
+function getField(body, key) {
+  return body?.[key]
+    ?? body?.customData?.[key]
+    ?? body?.extras?.[key]
+    ?? body?.data?.[key]
+    ?? null;
+}
+
 export default async function handler(req, res) {
   const timestamp = new Date().toISOString();
 
@@ -13,7 +21,19 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { phone, contact_id, first_name, tipo_cliente, km_anno, durata_mesi, segmento_auto, urgenza } = req.body;
+    console.log(`[${ENDPOINT}] RAW BODY:`, JSON.stringify(req.body));
+    console.log(`[${ENDPOINT}] HEADERS:`, JSON.stringify(req.headers));
+
+    const phone        = getField(req.body, 'phone');
+    const contact_id   = getField(req.body, 'contact_id');
+    const first_name   = getField(req.body, 'first_name');
+    const tipo_cliente = getField(req.body, 'tipo_cliente');
+    const km_anno      = getField(req.body, 'km_anno');
+    const durata_mesi  = getField(req.body, 'durata_mesi');
+    const segmento_auto = getField(req.body, 'segmento_auto');
+    const urgenza      = getField(req.body, 'urgenza');
+
+    console.log(`[${ENDPOINT}] Extracted phone=${phone} contact_id=${contact_id} first_name=${first_name}`);
     console.log(`[${timestamp}] [${ENDPOINT}] Richiesta per ${phone} (contact_id: ${contact_id})`);
 
     const redisKey = `vapi_pending:${phone}`;

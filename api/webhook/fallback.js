@@ -7,6 +7,16 @@ import { getContact, addContactTags } from '../../lib/ghl.js';
 const redis = Redis.fromEnv();
 const ENDPOINT = 'fallback';
 
+// Cerca un campo nel body supportando più strutture di wrapper GHL:
+// top-level, customData, extras, data (in ordine di priorità).
+function getField(body, key) {
+  return body?.[key]
+    ?? body?.customData?.[key]
+    ?? body?.extras?.[key]
+    ?? body?.data?.[key]
+    ?? null;
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -18,7 +28,15 @@ export default async function handler(req, res) {
   const log = (msg) => console.log(`[${new Date().toISOString()}] [${ENDPOINT}] ${msg}`);
 
   try {
-    const { phone: rawPhone, primary, contact_id } = req.body ?? {};
+    // Log raw sempre — indispensabile per debuggare wrapper format sconosciuti
+    console.log('[fallback] RAW BODY:', JSON.stringify(req.body));
+    console.log('[fallback] HEADERS:', JSON.stringify(req.headers));
+
+    const rawPhone   = getField(req.body, 'phone');
+    const primary    = getField(req.body, 'primary');
+    const contact_id = getField(req.body, 'contact_id');
+
+    console.log(`[fallback] Extracted phone=${rawPhone} primary=${primary} contact_id=${contact_id}`);
 
     // ── Step 1: Validazione ───────────────────────────────────────────────
     if (!rawPhone || !primary || !contact_id) {
