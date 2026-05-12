@@ -1,17 +1,47 @@
+import twilio from 'twilio';
 import axios from 'axios';
 import { Redis } from '@upstash/redis';
-import { findContactByPhone, updateContactFields, findOpportunity, moveOpportunityToHotLead } from '../../lib/ghl.js';
+import {
+  findContactByPhone,
+  updateContactFields,
+  addContactTags,
+  findOpportunity,
+  moveOpportunityToHotLead,
+} from '../../lib/ghl.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'vapi-call-ended';
 
-// Mappa i motivi di chiusura Vapi verso outcome leggibili
+// endedReason che indicano che il lead non ha risposto → recovery SMS
+const NO_ANSWER_REASONS = new Set([
+  'customer-did-not-answer',
+  'customer-busy',
+  'voicemail',
+  'no-answer',
+  'rejected',
+  'busy',
+]);
+
+// endedReason che indicano una chiamata conclusa normalmente
+const COMPLETED_REASONS = new Set([
+  'customer-ended-call',
+  'assistant-ended-call',
+  'silence-timed-out',
+  'max-duration-exceeded',
+  'hangup',
+  'completed',
+]);
+
 const REASON_TO_OUTCOME = {
   'customer-ended-call': 'completed',
   'assistant-ended-call': 'completed',
-  'voicemail': 'voicemail',
+  'silence-timed-out': 'completed',
   'max-duration-exceeded': 'completed',
+  'customer-did-not-answer': 'no_answer',
+  'customer-busy': 'no_answer',
+  'voicemail': 'voicemail',
   'no-answer': 'no_answer',
+  'rejected': 'no_answer',
   'busy': 'no_answer',
   'failed': 'failed',
 };
@@ -24,7 +54,26 @@ function internalUrl(path) {
   return `http://localhost:3000${path}`;
 }
 
+// Naviga un path dot-separated nel body Vapi, prova più varianti in ordine.
+function extractVapiField(body, ...paths) {
+  for (const path of paths) {
+    let val = body;
+    for (const key of path.split('.')) {
+      val = val?.[key];
+      if (val === undefined || val === null) { val = null; break; }
+    }
+    if (val !== null && val !== undefined) return val;
+  }
+  return null;
+}
+
 export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
   const timestamp = new Date().toISOString();
 
   if (req.method !== 'POST') {
@@ -33,81 +82,176 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { message } = req.body ?? {};
+    // Log raw sempre — critico per debug payload Vapi
+    console.log(`[${ENDPOINT}] RAW BODY:`, JSON.stringify(req.body));
+
+    const body = req.body ?? {};
+    const message = body.message;
 
     // Vapi invia vari tipi di evento — processiamo solo la fine chiamata
-    if (message?.type !== 'end-of-call-report') {
-      console.log(`[${timestamp}] [${ENDPOINT}] Evento ignorato: type=${message?.type}`);
+    const eventType = message?.type ?? body.type;
+    if (eventType !== 'end-of-call-report') {
+      console.log(`[${timestamp}] [${ENDPOINT}] Evento ignorato: type=${eventType}`);
       return res.status(200).json({ ok: true, ignored: true });
     }
 
-    const phone = message.call?.customer?.number;
-    const transcript = message.transcript ?? '';
-    const summary = message.analysis?.summary ?? message.summary ?? '';
-    const endedReason = message.endedReason ?? 'unknown';
-    const structuredData = message.analysis?.structuredData ?? {};
+    // Estrazione robusta: il nesting Vapi varia tra versioni API
+    const phone = extractVapiField(body,
+      'message.call.customer.number',
+      'call.customer.number',
+      'message.customer.number',
+      'customer.number'
+    );
+
+    const endedReason = extractVapiField(body,
+      'message.endedReason',
+      'message.call.endedReason',
+      'endedReason',
+      'call.endedReason'
+    ) ?? 'unknown';
+
+    const transcript = extractVapiField(body,
+      'message.transcript', 'transcript'
+    ) ?? '';
+
+    const summary = extractVapiField(body,
+      'message.analysis.summary', 'message.summary', 'analysis.summary', 'summary'
+    ) ?? '';
+
+    const structuredData = extractVapiField(body,
+      'message.analysis.structuredData', 'analysis.structuredData', 'structuredData'
+    ) ?? {};
 
     console.log(`[${timestamp}] [${ENDPOINT}] Fine chiamata — phone: ${phone}, reason: ${endedReason}`);
-    console.log(`[${timestamp}] [${ENDPOINT}] Summary: ${summary}`);
-    console.log(`[${timestamp}] [${ENDPOINT}] Transcript (${transcript.length} chars)`);
-
-    // structuredData.outcome ha priorità su endedReason
-    // TODO: configura il tuo Vapi assistant per produrre structuredData con campo "outcome"
-    const outcome = structuredData?.outcome ?? REASON_TO_OUTCOME[endedReason] ?? 'completed';
-    console.log(`[${timestamp}] [${ENDPOINT}] Outcome: ${outcome}`);
 
     if (!phone) {
       console.warn(`[${timestamp}] [${ENDPOINT}] customer.number mancante nel payload Vapi`);
-      return res.status(200).json({ ok: true, contact_updated: false, outcome });
+      return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
     }
 
-    const contact = await findContactByPhone(phone);
-    if (!contact) {
-      console.warn(`[${timestamp}] [${ENDPOINT}] Contatto GHL non trovato per ${phone}`);
-      return res.status(200).json({ ok: true, contact_updated: false, outcome });
-    }
+    // ── RAMO NO-ANSWER — recovery SMS ─────────────────────────────────────
+    if (NO_ANSWER_REASONS.has(endedReason)) {
+      console.log(`[${timestamp}] [${ENDPOINT}] No-answer branch — reason: ${endedReason}`);
 
-    console.log(`[${timestamp}] [${ENDPOINT}] Contatto GHL: ${contact.id} (${contact.firstName ?? phone})`);
-
-    // Aggiorna i custom fields su GHL
-    // TODO: verifica che i fieldKey "ai_call_summary" e "ai_call_outcome" corrispondano
-    //       ai nomi esatti nel tuo sub-account (controlla con GET /locations/{id}/customFields)
-    await updateContactFields(contact.id, [
-      { key: 'ai_call_summary', value: summary },
-      { key: 'ai_call_outcome', value: outcome },
-    ]);
-    console.log(`[${timestamp}] [${ENDPOINT}] Custom fields GHL aggiornati`);
-
-    // Muovi opportunity se lead caldo (da structuredData o outcome semantico)
-    const leadScore = Number(structuredData?.lead_score ?? 0);
-    const isHot = HOT_OUTCOMES.has(outcome) || leadScore >= 70;
-
-    if (isHot) {
-      const alreadyDone = await redis.get(`handoff_done:${phone}`);
-      if (!alreadyDone) {
-        console.log(`[${timestamp}] [${ENDPOINT}] Lead caldo — avvio handoff per ${phone}`);
-
-        const opp = await findOpportunity(contact.id);
-        if (opp) {
-          await moveOpportunityToHotLead(opp.id);
-          console.log(`[${timestamp}] [${ENDPOINT}] Opportunity ${opp.id} → Hot Lead stage`);
-        }
-
-        try {
-          await axios.post(
-            internalUrl('/api/webhook/hot-lead-handoff'),
-            { phone },
-            { timeout: 8000 }
-          );
-        } catch (e) {
-          console.error(`[${timestamp}] [${ENDPOINT}] Errore chiamata handoff:`, e.message);
-        }
-      } else {
-        console.log(`[${timestamp}] [${ENDPOINT}] Handoff già eseguito per ${phone} — skip`);
+      // Idempotenza: blocca doppi invii (Vapi può mandare l'evento 2-3 volte)
+      const alreadySent = await redis.get(`recovery_sms_sent:${phone}`);
+      if (alreadySent) {
+        console.log(`[${timestamp}] [${ENDPOINT}] Recovery SMS già inviato, skip per evitare duplicati`);
+        return res.status(200).json({ ok: true, action: 'skipped_duplicate' });
       }
+
+      // Recupera first_name da GHL
+      let firstName = null;
+      let contactId = null;
+      try {
+        const contact = await findContactByPhone(phone);
+        firstName = contact?.firstName ?? null;
+        contactId = contact?.id ?? null;
+        console.log(`[${timestamp}] [${ENDPOINT}] Contact: ${contactId} firstName=${firstName}`);
+      } catch (e) {
+        console.warn(`[${timestamp}] [${ENDPOINT}] WARN: GHL contact fetch failed: ${e.message}`);
+      }
+
+      // SMS di recovery
+      const greeting = firstName ? `Ciao ${firstName}` : 'Ciao';
+      const smsBody =
+        `${greeting}, ti ho appena chiamata ma non sono riuscita a sentirti. ` +
+        `Possiamo rifissare la chiamata in un altro momento, oppure se preferisci ` +
+        `puoi chiedermi qui in chat. Sara di AutoExperience`;
+
+      try {
+        const twilioClient = twilio(
+          process.env.TWILIO_ACCOUNT_SID,
+          process.env.TWILIO_AUTH_TOKEN
+        );
+        const sms = await twilioClient.messages.create({
+          body: smsBody,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: phone,
+        });
+        console.log(`[${timestamp}] [${ENDPOINT}] Recovery SMS sent to ${phone}, twilio_sid=${sms.sid}`);
+      } catch (e) {
+        console.error(`[${timestamp}] [${ENDPOINT}] ERROR SMS: ${e.message}`);
+      }
+
+      // Redis: engaged 24h + anti-duplicato 1h
+      await redis.set(`engaged:${phone}`, '1', { ex: 86400 });
+      await redis.set(`recovery_sms_sent:${phone}`, '1', { ex: 3600 });
+
+      // GHL: tag + custom fields (best effort, non bloccano il flusso)
+      if (contactId) {
+        try {
+          await addContactTags(contactId, ['call_no_answer', 'engaged_sms']);
+        } catch (e) {
+          console.warn(`[${timestamp}] [${ENDPOINT}] WARN: GHL tag add failed: ${e.message}`);
+        }
+        try {
+          await updateContactFields(contactId, [
+            { key: 'channel_status', value: 'engaged_sms_recovery' },
+            { key: 'ai_call_outcome', value: 'no_answer_recovery_sent' },
+          ]);
+        } catch (e) {
+          console.warn(`[${timestamp}] [${ENDPOINT}] WARN: GHL fields update failed: ${e.message}`);
+        }
+      }
+
+      return res.status(200).json({ ok: true, action: 'recovery_sms_sent' });
     }
 
-    return res.status(200).json({ ok: true, contact_updated: true, outcome });
+    // ── RAMO CHIAMATA COMPLETATA — logica esistente invariata ─────────────
+    if (COMPLETED_REASONS.has(endedReason)) {
+      const outcome = structuredData?.outcome ?? REASON_TO_OUTCOME[endedReason] ?? 'completed';
+      console.log(`[${timestamp}] [${ENDPOINT}] Call completed normally, endedReason=${endedReason} outcome=${outcome}`);
+      console.log(`[${timestamp}] [${ENDPOINT}] Summary: ${summary}`);
+      console.log(`[${timestamp}] [${ENDPOINT}] Transcript (${transcript.length} chars)`);
+
+      const contact = await findContactByPhone(phone);
+      if (!contact) {
+        console.warn(`[${timestamp}] [${ENDPOINT}] Contatto GHL non trovato per ${phone}`);
+        return res.status(200).json({ ok: true, action: 'call_completed_normally' });
+      }
+
+      console.log(`[${timestamp}] [${ENDPOINT}] Contatto GHL: ${contact.id} (${contact.firstName ?? phone})`);
+
+      await updateContactFields(contact.id, [
+        { key: 'ai_call_summary', value: summary },
+        { key: 'ai_call_outcome', value: outcome },
+      ]);
+      console.log(`[${timestamp}] [${ENDPOINT}] Custom fields GHL aggiornati`);
+
+      const leadScore = Number(structuredData?.lead_score ?? 0);
+      const isHot = HOT_OUTCOMES.has(outcome) || leadScore >= 70;
+
+      if (isHot) {
+        const alreadyDone = await redis.get(`handoff_done:${phone}`);
+        if (!alreadyDone) {
+          console.log(`[${timestamp}] [${ENDPOINT}] Lead caldo — avvio handoff per ${phone}`);
+          const opp = await findOpportunity(contact.id);
+          if (opp) {
+            await moveOpportunityToHotLead(opp.id);
+            console.log(`[${timestamp}] [${ENDPOINT}] Opportunity ${opp.id} → Hot Lead stage`);
+          }
+          try {
+            await axios.post(
+              internalUrl('/api/webhook/hot-lead-handoff'),
+              { phone },
+              { timeout: 8000 }
+            );
+          } catch (e) {
+            console.error(`[${timestamp}] [${ENDPOINT}] Errore chiamata handoff:`, e.message);
+          }
+        } else {
+          console.log(`[${timestamp}] [${ENDPOINT}] Handoff già eseguito per ${phone} — skip`);
+        }
+      }
+
+      return res.status(200).json({ ok: true, action: 'call_completed_normally' });
+    }
+
+    // ── RAMO FALLBACK — endedReason imprevisto (es. errori interni Vapi) ──
+    console.warn(`[${timestamp}] [${ENDPOINT}] WARN: endedReason non gestito "${endedReason}" — skip`);
+    return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
+
   } catch (err) {
     const errTs = new Date().toISOString();
     console.error(`[${errTs}] [${ENDPOINT}] Errore:`, err.message);
