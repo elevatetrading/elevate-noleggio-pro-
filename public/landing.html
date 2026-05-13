@@ -8,6 +8,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body class="bg-white text-slate-900 antialiased">
@@ -39,9 +40,7 @@
           Contattami subito
         </button>
         <a
-          href="https://tally.so/r/kdKOz6"
-          target="_blank"
-          rel="noopener noreferrer"
+          href="/quiz.html"
           class="px-8 py-4 border-2 border-blue-500 text-blue-600 hover:bg-blue-50 text-lg font-semibold rounded-xl transition-colors duration-150 text-center"
         >
           Fai il quiz
@@ -205,13 +204,12 @@
             <!-- Email -->
             <div>
               <label for="field-email" class="block text-sm font-medium text-slate-700 mb-1.5">
-                Email <span class="text-red-500" aria-hidden="true">*</span>
+                Email <span class="text-slate-400 font-normal text-xs">(opzionale)</span>
               </label>
               <input
                 type="email"
                 id="field-email"
                 name="email"
-                required
                 autocomplete="email"
                 placeholder="mario@esempio.it"
                 class="w-full px-4 py-3 border border-slate-200 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
@@ -292,7 +290,7 @@
         </div>
         <div>
           <p class="text-xl font-bold text-slate-900">Grazie, <span id="success-name"></span>!</p>
-          <p class="text-slate-500 mt-2 text-sm leading-relaxed">Sara ti contatterà a brevissimo<br />sul numero che hai indicato.</p>
+          <p class="text-slate-500 mt-2 text-sm leading-relaxed">Sara ti chiamerà tra qualche secondo.<br>Rispondi quando il telefono squilla. 📞</p>
         </div>
         <button
           id="close-success"
@@ -390,8 +388,16 @@
       return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
     }
 
-    function isValidPhone(phone) {
-      return /^\d{9,15}$/.test(phone.replace(/[\s\-().+]/g, ''));
+    function normalizePhone(raw) {
+      var s = String(raw || '').replace(/[\s\-().]/g, '');
+      if (/^0039/.test(s))           s = '+39' + s.slice(4);
+      else if (/^39\d{9,10}$/.test(s)) s = '+' + s;
+      else if (/^3\d{9}$/.test(s))   s = '+39' + s;
+      return s;
+    }
+
+    function isValidPhone(raw) {
+      return /^\+39\d{9,10}$/.test(normalizePhone(raw));
     }
 
     document.getElementById('contact-form').addEventListener('submit', async function(e) {
@@ -418,7 +424,7 @@
         valid = false;
       }
 
-      if (!isValidEmail(email)) {
+      if (email && !isValidEmail(email)) {
         document.getElementById('email-error').classList.remove('hidden');
         valid = false;
       }
@@ -432,18 +438,16 @@
 
       var submitBtn = document.getElementById('submit-btn');
       submitBtn.disabled = true;
-      submitBtn.textContent = 'Invio in corso...';
+      submitBtn.innerHTML = '<svg class="inline w-4 h-4 mr-2" style="animation:spin .8s linear infinite" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity=".25"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>Sto preparando la chiamata...';
 
       try {
+        var normalizedPhone = normalizePhone(phone);
+        var payload = { first_name: firstName, phone: normalizedPhone, preferred_channel: channel.value };
+        if (email) payload.email = email;
         var res = await fetch('https://elevate-noleggio-pro.vercel.app/api/webhook/landing-contact', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            first_name: firstName,
-            phone: phone,
-            email: email,
-            preferred_channel: channel.value
-          })
+          body: JSON.stringify(payload)
         });
 
         if (res.ok) {

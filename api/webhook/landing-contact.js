@@ -52,7 +52,10 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { first_name, phone: rawPhone, email, preferred_channel } = req.body ?? {};
+    const {
+      first_name, phone: rawPhone, email, preferred_channel,
+      tipo_cliente, km_anno, segmento_auto, urgenza, durata_mesi,
+    } = req.body ?? {};
 
     // ── Unico campo obbligatorio: phone ───────────────────────────────────
     if (!rawPhone) {
@@ -90,7 +93,12 @@ export default async function handler(req, res) {
     const customFields = [
       { key: 'contatto_preferito', field_value: channel },
       { key: 'channel_status',     field_value: channelStatus },
-      scheduledFor && { key: 'next_contact_at', field_value: scheduledFor.toISOString() },
+      scheduledFor  && { key: 'next_contact_at', field_value: scheduledFor.toISOString() },
+      tipo_cliente  && { key: 'tipo_cliente',    field_value: tipo_cliente },
+      km_anno       && { key: 'km_anno',         field_value: String(km_anno) },
+      segmento_auto && { key: 'segmento_auto',   field_value: segmento_auto },
+      urgenza       && { key: 'urgenza',         field_value: urgenza },
+      durata_mesi   && { key: 'durata_mesi',     field_value: String(durata_mesi) },
     ].filter(Boolean);
 
     const upsertPayload = {

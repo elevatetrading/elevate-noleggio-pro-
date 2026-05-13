@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quiz Noleggio — AutoExperience Siracusa</title>
+  <meta name="description" content="Rispondi a 9 domande e ricevi un preventivo noleggio auto su misura da AutoExperience Siracusa." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes spin   { to { transform: rotate(360deg); } }
+    .fade-up { animation: fadeUp 0.22s ease forwards; }
+    .spinner { display: inline-block; animation: spin 0.8s linear infinite; }
+  </style>
+</head>
+<body class="bg-white min-h-screen">
+
+  <!-- Header con progress bar -->
+  <header class="fixed top-0 left-0 right-0 z-10 bg-white/95 backdrop-blur-sm border-b border-slate-100 px-4 py-3">
+    <div class="max-w-lg mx-auto flex items-center gap-4">
+      <a href="/landing.html" class="text-slate-400 hover:text-slate-700 transition-colors flex-shrink-0 p-1 -ml-1 rounded focus:outline-none focus:ring-2 focus:ring-blue-500" aria-label="Torna alla homepage">
+        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+      </a>
+      <div class="flex-1">
+        <div class="flex items-center justify-between mb-1.5">
+          <span id="progress-label" class="text-xs text-slate-400"></span>
+          <span id="progress-pct" class="text-xs text-blue-500 font-medium"></span>
+        </div>
+        <div class="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+          <div id="progress-bar" class="h-full bg-blue-500 rounded-full transition-all duration-400" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Contenuto principale -->
+  <main class="pt-20 min-h-screen flex flex-col">
+    <div id="step-container" class="flex-1 flex flex-col items-center justify-center px-4 py-10">
+      <!-- Rendered by JS -->
+    </div>
+  </main>
+
+  <script>
+    const BACKEND_URL = 'https://elevate-noleggio-pro.vercel.app/api/webhook/landing-contact';
+
+    // ── Definizione steps ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        id: 'welcome',
+        type: 'intro',
+      },
+      {
+        id: 'first_name',
+        type: 'text',
+        question: 'Come ti chiami?',
+        placeholder: 'Mario',
+        autocomplete: 'given-name',
+        optional: true,
+      },
+      {
+        id: 'tipo_cliente',
+        type: 'choice',
+        question: 'Come utilizzerai l\'auto?',
+        options: [
+          { label: 'Uso privato',                      icon: '🚗', value: 'privato' },
+          { label: 'Libero Professionista / P.IVA',    icon: '💼', value: 'p.iva'   },
+          { label: 'Azienda',                          icon: '🏢', value: 'p.iva', tag: 'azienda' },
+        ],
+      },
+      {
+        id: 'km_anno',
+        type: 'choice',
+        question: 'Quanti km percorri all\'anno?',
+        options: [
+          { label: 'Meno di 10.000 km', value: '10000' },
+          { label: '10.000 – 15.000 km', value: '15000' },
+          { label: '15.000 – 20.000 km', value: '20000' },
+          { label: '20.000 – 30.000 km', value: '25000' },
+          { label: 'Più di 30.000 km',  value: '35000' },
+        ],
+      },
+      {
+        id: 'segmento_auto',
+        type: 'choice',
+        question: 'Che tipo di auto ti interessa?',
+        options: [
+          { label: 'City car', icon: '🏙️', desc: 'Compatta, ideale per la città',  value: 'city_car' },
+          { label: 'Berlina',  icon: '🚘', desc: 'Comfort per ogni distanza',       value: 'berlina'  },
+          { label: 'SUV',      icon: '🚙', desc: 'Versatile, spaziosa, alta',       value: 'suv'      },
+          { label: 'Premium',  icon: '✨', desc: 'Marchi di lusso e prestazioni',   value: 'premium'  },
+        ],
+      },
+      {
+        id: 'durata_mesi',
+        type: 'choice',
+        question: 'Durata del contratto?',
+        options: [
+          { label: '24 mesi', value: 24 },
+          { label: '36 mesi', value: 36, badge: 'Più scelto' },
+          { label: '48 mesi', value: 48 },
+          { label: '60 mesi', value: 60 },
+        ],
+      },
+      {
+        id: 'urgenza',
+        type: 'choice',
+        question: 'Quando ti serve l\'auto?',
+        options: [
+          { label: 'Entro 1 mese',       icon: '⚡', value: '1 mese'    },
+          { label: 'Entro 3 mesi',       icon: '📅', value: '3 mesi'    },
+          { label: 'Entro 6 mesi',       icon: '🗓️', value: '6 mesi'    },
+          { label: 'Sto solo valutando', icon: '🤔', value: 'valutando' },
+        ],
+      },
+      {
+        id: 'auto_attuale',
+        type: 'choice',
+        question: 'Hai già un\'auto che vorresti cambiare?',
+        extra: true,
+        options: [
+          { label: 'Sì, voglio cambiarla',  value: 'si' },
+          { label: 'No, è la prima auto',   value: 'no' },
+        ],
+      },
+      {
+        id: 'budget',
+        type: 'choice',
+        question: 'Hai un budget mensile in mente?',
+        extra: true,
+        options: [
+          { label: 'Meno di 300€/mese',  value: '<300'        },
+          { label: '300 – 500€/mese',    value: '300-500'     },
+          { label: '500 – 700€/mese',    value: '500-700'     },
+          { label: 'Più di 700€/mese',   value: '>700'        },
+          { label: 'Non ho preferenze',  value: 'flessibile'  },
+        ],
+      },
+      {
+        id: 'contacts',
+        type: 'contact',
+        question: 'Quasi fatto!',
+        subtitle: 'Sara ti chiamerà con le offerte più adatte alle tue esigenze.',
+      },
+    ];
+
+    const QUESTIONS_COUNT = STEPS.length - 1; // escluso welcome
+
+    // ── Stato quiz ────────────────────────────────────────────────────────────
+    let currentStep = 0;
+    const answers  = {};
+    const extraTags = [];
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function h(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    function attr(s) {
+      return String(s).replace(/"/g, '&quot;');
+    }
+
+    function normalizePhone(raw) {
+      let s = String(raw || '').replace(/[\s\-().]/g, '');
+      if (/^0039/.test(s))              s = '+39' + s.slice(4);
+      else if (/^39\d{9,10}$/.test(s)) s = '+' + s;
+      else if (/^3\d{9}$/.test(s))     s = '+39' + s;
+      return s;
+    }
+    function isValidPhone(raw) {
+      return /^\+39\d{9,10}$/.test(normalizePhone(raw));
+    }
+    function isValidEmail(email) {
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    }
+
+    // ── Navigazione ───────────────────────────────────────────────────────────
+    function goToStep(idx) {
+      currentStep = Math.max(0, Math.min(idx, STEPS.length - 1));
+      updateProgress();
+      renderStep();
+    }
+    function nextStep() { goToStep(currentStep + 1); }
+    function prevStep() { goToStep(currentStep - 1); }
+
+    function updateProgress() {
+      const bar   = document.getElementById('progress-bar');
+      const label = document.getElementById('progress-label');
+      const pct   = document.getElementById('progress-pct');
+      if (currentStep === 0) {
+        bar.style.width = '0%';
+        label.textContent = '';
+        pct.textContent   = '';
+        return;
+      }
+      const p = Math.round((currentStep / QUESTIONS_COUNT) * 100);
+      bar.style.width = p + '%';
+      label.textContent = `Domanda ${currentStep} di ${QUESTIONS_COUNT}`;
+      pct.textContent   = p + '%';
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────
+    function renderStep() {
+      const container = document.getElementById('step-container');
+      const step = STEPS[currentStep];
+      let html = '';
+
+      if (step.type === 'intro')   html = renderIntro();
+      if (step.type === 'text')    html = renderText(step);
+      if (step.type === 'choice')  html = renderChoice(step);
+      if (step.type === 'contact') html = renderContact(step);
+
+      container.innerHTML = `<div class="w-full max-w-lg fade-up">${html}</div>`;
+      attachHandlers(step);
+    }
+
+    function backBtn() {
+      if (currentStep <= 1) return '';
+      return `<button id="back-btn" class="flex items-center gap-1.5 text-sm text-slate-400 hover:text-slate-700 transition-colors mb-6 focus:outline-none focus:ring-2 focus:ring-slate-300 rounded-lg px-1">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+        Indietro
+      </button>`;
+    }
+
+    function stepLabel() {
+      return `<p class="text-xs text-blue-500 font-semibold uppercase tracking-widest mb-3">Domanda ${currentStep} di ${QUESTIONS_COUNT}</p>`;
+    }
+
+    function renderIntro() {
+      return `<div class="text-center px-2">
+        <div class="text-6xl mb-8">🚗</div>
+        <h1 class="text-3xl sm:text-4xl font-bold text-slate-900 leading-tight mb-4">Trova il noleggio<br>perfetto in 2 minuti</h1>
+        <p class="text-slate-500 text-lg mb-10 leading-relaxed">9 domande veloci per ricevere un preventivo su misura,<br class="hidden sm:block">senza alcun impegno.</p>
+        <button id="intro-cta" class="w-full sm:w-auto px-10 py-4 bg-blue-500 hover:bg-blue-600 text-white text-lg font-semibold rounded-xl transition-colors shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">
+          Iniziamo →
+        </button>
+        <p class="mt-6 text-sm text-slate-400">Gratis · Nessun impegno · 2 minuti</p>
+      </div>`;
+    }
+
+    function renderText(step) {
+      const saved = answers[step.id] || '';
+      return `<div class="px-2">
+        ${backBtn()}
+        ${stepLabel()}
+        <h2 class="text-2xl sm:text-3xl font-bold text-slate-900 mb-2">${h(step.question)}</h2>
+        ${step.optional ? '<p class="text-sm text-slate-400 mb-8">Opzionale — puoi saltare</p>' : '<div class="mb-8"></div>'}
+        <input type="text" id="text-input" value="${attr(saved)}" placeholder="${attr(step.placeholder || '')}"
+          autocomplete="${attr(step.autocomplete || 'off')}"
+          class="w-full px-4 py-4 border-2 border-slate-200 rounded-xl text-slate-900 text-lg placeholder-slate-400 focus:outline-none focus:border-blue-500 transition mb-6" />
+        <div class="flex gap-3">
+          ${step.optional ? '<button id="skip-btn" class="flex-1 px-5 py-3.5 border-2 border-slate-200 text-slate-600 hover:border-slate-300 font-medium rounded-xl transition-colors focus:outline-none focus:ring-2 focus:ring-slate-300">Salta</button>' : ''}
+          <button id="text-next-btn" class="flex-1 px-5 py-3.5 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-xl transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">Continua →</button>
+        </div>
+      </div>`;
+    }
+
+    function renderChoice(step) {
+      const optionsHtml = step.options.map((opt) => {
+        const isSelected = String(answers[step.id]) === String(opt.value);
+        const badge  = opt.badge ? `<span class="ml-auto text-xs bg-blue-100 text-blue-600 font-medium px-2 py-0.5 rounded-full flex-shrink-0">${h(opt.badge)}</span>` : '';
+        const icon   = opt.icon  ? `<span class="text-xl mr-3 flex-shrink-0">${opt.icon}</span>` : '';
+        const desc   = opt.desc  ? `<p class="text-sm text-slate-400 mt-0.5 font-normal">${h(opt.desc)}</p>` : '';
+        return `<button class="option-btn w-full flex items-center px-5 py-4 rounded-xl border-2 text-left transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1
+          ${isSelected ? 'border-blue-500 bg-blue-50' : 'border-slate-200 bg-white hover:border-blue-300 hover:bg-slate-50'}"
+          data-value="${attr(String(opt.value))}"
+          ${opt.tag ? `data-tag="${attr(opt.tag)}"` : ''}>
+          ${icon}
+          <span class="flex-1"><span class="font-medium text-slate-900">${h(opt.label)}</span>${desc}</span>
+          ${badge}
+        </button>`;
+      }).join('');
+
+      return `<div class="px-2">
+        ${backBtn()}
+        ${stepLabel()}
+        <h2 class="text-2xl sm:text-3xl font-bold text-slate-900 mb-8">${h(step.question)}</h2>
+        <div class="flex flex-col gap-3">${optionsHtml}</div>
+      </div>`;
+    }
+
+    function renderContact(step) {
+      return `<div class="px-2">
+        ${backBtn()}
+        <p class="text-xs text-blue-500 font-semibold uppercase tracking-widest mb-3">Ultimo passo</p>
+        <h2 class="text-2xl sm:text-3xl font-bold text-slate-900 mb-2">${h(step.question)}</h2>
+        <p class="text-slate-500 mb-8 leading-relaxed">${h(step.subtitle)}</p>
+        <div class="flex flex-col gap-4">
+          <div>
+            <label for="contact-phone" class="block text-sm font-medium text-slate-700 mb-1.5">
+              Numero di telefono <span class="text-red-500" aria-hidden="true">*</span>
+            </label>
+            <input type="tel" id="contact-phone" autocomplete="tel" placeholder="+39 348 123 4567"
+              class="w-full px-4 py-3.5 border-2 border-slate-200 rounded-xl text-slate-900 text-base placeholder-slate-400 focus:outline-none focus:border-blue-500 transition" />
+            <p id="phone-error" class="hidden mt-1.5 text-xs text-red-600" role="alert">
+              Inserisci un numero italiano valido (es. +39 348 1234567)
+            </p>
+          </div>
+          <div>
+            <label for="contact-email" class="block text-sm font-medium text-slate-700 mb-1.5">
+              Email <span class="text-slate-400 font-normal text-xs">(opzionale)</span>
+            </label>
+            <input type="email" id="contact-email" autocomplete="email" placeholder="mario@esempio.it"
+              class="w-full px-4 py-3.5 border-2 border-slate-200 rounded-xl text-slate-900 text-base placeholder-slate-400 focus:outline-none focus:border-blue-500 transition" />
+            <p id="email-error" class="hidden mt-1.5 text-xs text-red-600" role="alert">Inserisci un'email valida</p>
+          </div>
+          <label class="flex items-start gap-3 cursor-pointer">
+            <input type="checkbox" id="contact-privacy" class="mt-0.5 w-4 h-4 flex-shrink-0 accent-blue-500" />
+            <span class="text-sm text-slate-600 leading-relaxed">
+              Acconsento al trattamento dei miei dati personali ai sensi del GDPR.
+              <span class="text-red-500" aria-hidden="true">*</span>
+            </span>
+          </label>
+          <p id="privacy-error" class="hidden text-xs text-red-600" role="alert">Il consenso è obbligatorio per procedere</p>
+          <p id="submit-error" class="hidden px-4 py-3 bg-red-50 text-red-700 rounded-xl text-sm" role="alert">
+            Qualcosa è andato storto. Riprova tra qualche secondo.
+          </p>
+          <button id="submit-btn"
+            class="w-full py-4 bg-blue-500 hover:bg-blue-600 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold text-lg rounded-xl transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">
+            Invia la mia richiesta →
+          </button>
+          <p class="text-center text-xs text-slate-400">Nessun impegno — ricevi solo un preventivo su misura</p>
+        </div>
+      </div>`;
+    }
+
+    // ── Attach event handlers ─────────────────────────────────────────────────
+    function attachHandlers(step) {
+      const backBtnEl = document.getElementById('back-btn');
+      if (backBtnEl) backBtnEl.addEventListener('click', prevStep);
+
+      if (step.type === 'intro') {
+        document.getElementById('intro-cta').addEventListener('click', nextStep);
+      }
+
+      if (step.type === 'text') {
+        const input   = document.getElementById('text-input');
+        const nextBtn = document.getElementById('text-next-btn');
+        const skipBtn = document.getElementById('skip-btn');
+        input.focus();
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); saveText(step, input); }
+        });
+        nextBtn.addEventListener('click', () => saveText(step, input));
+        if (skipBtn) skipBtn.addEventListener('click', nextStep);
+      }
+
+      if (step.type === 'choice') {
+        document.querySelectorAll('.option-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            let val = btn.dataset.value;
+            // Parse numeric values for durata_mesi
+            if (!isNaN(Number(val)) && val !== '') val = Number(val);
+            answers[step.id] = val;
+            if (btn.dataset.tag) extraTags.push(btn.dataset.tag);
+            // Feedback visivo poi avanza
+            btn.classList.replace('border-slate-200', 'border-blue-500');
+            btn.classList.replace('bg-white', 'bg-blue-50');
+            setTimeout(nextStep, 220);
+          });
+        });
+      }
+
+      if (step.type === 'contact') {
+        document.getElementById('contact-phone').focus();
+        document.getElementById('submit-btn').addEventListener('click', handleSubmit);
+      }
+    }
+
+    function saveText(step, input) {
+      const val = input.value.trim();
+      if (val) answers[step.id] = val;
+      nextStep();
+    }
+
+    // ── Submit ────────────────────────────────────────────────────────────────
+    async function handleSubmit() {
+      const phoneInput   = document.getElementById('contact-phone');
+      const emailInput   = document.getElementById('contact-email');
+      const privacyChk   = document.getElementById('contact-privacy');
+      const submitBtn    = document.getElementById('submit-btn');
+
+      // Reset errors
+      ['phone-error','email-error','privacy-error','submit-error'].forEach((id) => {
+        document.getElementById(id).classList.add('hidden');
+      });
+
+      const rawPhone = phoneInput.value.trim();
+      const email    = emailInput.value.trim();
+      const privacy  = privacyChk.checked;
+      let valid = true;
+
+      if (!isValidPhone(rawPhone)) {
+        document.getElementById('phone-error').classList.remove('hidden');
+        valid = false;
+      }
+      if (email && !isValidEmail(email)) {
+        document.getElementById('email-error').classList.remove('hidden');
+        valid = false;
+      }
+      if (!privacy) {
+        document.getElementById('privacy-error').classList.remove('hidden');
+        valid = false;
+      }
+      if (!valid) return;
+
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<svg class="spinner inline w-4 h-4 mr-2" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity=".25"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>Sto elaborando...';
+
+      // Build payload
+      const phone = normalizePhone(rawPhone);
+      const payload = { phone, preferred_channel: 'phone' };
+      if (answers.first_name)    payload.first_name    = answers.first_name;
+      if (email)                 payload.email         = email;
+      if (answers.tipo_cliente)  payload.tipo_cliente  = answers.tipo_cliente;
+      if (answers.km_anno)       payload.km_anno       = String(answers.km_anno);
+      if (answers.segmento_auto) payload.segmento_auto = answers.segmento_auto;
+      if (answers.urgenza)       payload.urgenza       = answers.urgenza;
+      if (answers.durata_mesi)   payload.durata_mesi   = Number(answers.durata_mesi);
+
+      try {
+        const response = await fetch(BACKEND_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (response.ok) {
+          showSuccess(answers.first_name || '');
+        } else {
+          document.getElementById('submit-error').classList.remove('hidden');
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Invia la mia richiesta →';
+        }
+      } catch (_) {
+        document.getElementById('submit-error').classList.remove('hidden');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Invia la mia richiesta →';
+      }
+    }
+
+    function showSuccess(firstName) {
+      document.getElementById('progress-bar').style.width = '100%';
+      document.getElementById('progress-pct').textContent = '100%';
+      document.getElementById('progress-label').textContent = 'Completato';
+
+      const name = firstName ? `, ${h(firstName)}` : '';
+      document.getElementById('step-container').innerHTML = `
+        <div class="w-full max-w-lg fade-up text-center px-4">
+          <div class="w-20 h-20 rounded-full bg-green-100 flex items-center justify-center mx-auto mb-6">
+            <svg class="w-10 h-10 text-green-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+          <h2 class="text-2xl sm:text-3xl font-bold text-slate-900 mb-3">Perfetto${name}! 🎉</h2>
+          <p class="text-slate-500 text-lg leading-relaxed mb-8">
+            Sara ti chiamerà tra qualche secondo.<br>
+            Tieni il telefono a portata di mano e rispondi quando squilla. 📞
+          </p>
+          <div class="inline-flex items-center gap-2 bg-blue-50 text-blue-700 px-5 py-3 rounded-xl text-sm font-medium mb-8">
+            <svg class="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.64 3.42 2 2 0 0 1 3.61 1.25h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.84a16 16 0 0 0 6.29 6.29l.96-.96a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>
+            </svg>
+            Chiamata in arrivo entro 60 secondi
+          </div>
+          <a href="/landing.html" class="block text-sm text-slate-400 hover:text-slate-600 transition-colors">
+            Torna alla homepage
+          </a>
+        </div>`;
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    goToStep(0);
+  </script>
+</body>
+</html>
