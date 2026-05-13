@@ -53,7 +53,7 @@ export default async function handler(req, res) {
 
   try {
     const {
-      first_name, phone: rawPhone, email, preferred_channel,
+      first_name, last_name, phone: rawPhone, email, preferred_channel,
       tipo_cliente, km_anno, segmento_auto, urgenza, durata_mesi,
     } = req.body ?? {};
 
@@ -69,6 +69,13 @@ export default async function handler(req, res) {
 
     // Campi opzionali con default
     const firstName = first_name ? String(first_name).trim() : '';
+    const explicitLastName = last_name ? String(last_name).trim() : '';
+    const lastName = explicitLastName || (() => {
+      const digits = phone.replace(/\D/g, '');
+      const generated = digits.slice(-7);
+      log(`last_name generato: ${generated}`);
+      return generated;
+    })();
     const channel   = preferred_channel ?? 'phone';
 
     if (email && !isValidEmail(email)) {
@@ -104,6 +111,7 @@ export default async function handler(req, res) {
     const upsertPayload = {
       locationId: process.env.GHL_LOCATION_ID,
       ...(firstName && { firstName }),
+      lastName,
       phone,
       ...(email && { email }),
       tags: ['src:landing', channelTag],
