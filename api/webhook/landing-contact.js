@@ -10,14 +10,34 @@ import { upsertContact } from '../../lib/ghl.js';
 const redis = Redis.fromEnv();
 const ENDPOINT = 'landing-contact';
 
+const ALLOWED_ORIGINS = [
+  'https://autoexperience.vercel.app',
+  'https://elevate-noleggio-pro.vercel.app',
+];
+
+function setCorsHeaders(req, res) {
+  const origin = req.headers['origin'];
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else if (!origin) {
+    // Server-to-server call — nessun header CORS necessario
+  } else {
+    // Origin non in lista — riflettiamo comunque per non bloccare test locali,
+    // ma logghiamo il warning
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email ?? ''));
 }
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  setCorsHeaders(req, res);
 
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
@@ -34,52 +54,50 @@ export default async function handler(req, res) {
   try {
     const { first_name, phone: rawPhone, email, preferred_channel } = req.body ?? {};
 
-    // ── Validazione campi required ────────────────────────────────────────
-    if (!first_name || !String(first_name).trim()) {
-      return res.status(400).json({ error: 'Campo obbligatorio mancante: first_name' });
-    }
+    // ── Unico campo obbligatorio: phone ───────────────────────────────────
     if (!rawPhone) {
       return res.status(400).json({ error: 'Campo obbligatorio mancante: phone' });
     }
-    if (!email) {
-      return res.status(400).json({ error: 'Campo obbligatorio mancante: email' });
-    }
-    if (!preferred_channel) {
-      return res.status(400).json({ error: 'Campo obbligatorio mancante: preferred_channel' });
-    }
-
-    const firstName = String(first_name).trim();
 
     const phone = normalizePhone(rawPhone);
     if (!phone) {
       return res.status(400).json({ error: `Numero di telefono non valido: "${rawPhone}"` });
     }
 
-    if (!isValidEmail(email)) {
+    // Campi opzionali con default
+    const firstName = first_name ? String(first_name).trim() : '';
+    const channel   = preferred_channel ?? 'phone';
+
+    if (email && !isValidEmail(email)) {
       return res.status(400).json({ error: `Email non valida: "${email}"` });
     }
 
-    log(`Richiesta da ${firstName} — phone: ${phone} — canale: ${preferred_channel}`);
+    const origin = req.headers['origin'] ?? 'direct';
+    if (origin !== 'direct' && !ALLOWED_ORIGINS.includes(origin)) {
+      log(`WARN: origin non in whitelist "${origin}"`);
+    }
+
+    log(`Richiesta — phone: ${phone} first_name: ${firstName || '(assente)'} canale: ${channel} origin: ${origin}`);
 
     // ── Routing canale ────────────────────────────────────────────────────
-    const { primary, whatsappDegraded, unknownChannel } = mapChannel(preferred_channel);
-    if (unknownChannel) log(`WARN: preferred_channel non riconosciuto "${preferred_channel}" → default sms`);
+    const { primary, whatsappDegraded, unknownChannel } = mapChannel(channel);
+    if (unknownChannel) log(`WARN: preferred_channel non riconosciuto "${channel}" → default sms`);
     const { channelStatus, actionTaken, scheduledFor } = resolveChannelState(primary);
     const channelTag = primary === 'call' ? 'channel:phone' : 'channel:sms';
     log(`Canale: ${primary} — action: ${actionTaken} — tag: ${channelTag}`);
 
     // ── Upsert contatto GHL ───────────────────────────────────────────────
     const customFields = [
-      { key: 'contatto_preferito', field_value: preferred_channel },
+      { key: 'contatto_preferito', field_value: channel },
       { key: 'channel_status',     field_value: channelStatus },
       scheduledFor && { key: 'next_contact_at', field_value: scheduledFor.toISOString() },
     ].filter(Boolean);
 
     const upsertPayload = {
       locationId: process.env.GHL_LOCATION_ID,
-      firstName,
+      ...(firstName && { firstName }),
       phone,
-      email,
+      ...(email && { email }),
       tags: ['src:landing', channelTag],
       customFields,
     };
@@ -91,18 +109,19 @@ export default async function handler(req, res) {
     }
 
     // ── Azione immediata in base al canale ────────────────────────────────
+    const displayName = firstName || 'Cliente';
     const smsOpeningBody =
-      `Ciao ${firstName}! Sono Sara di AutoExperience, ricevo la tua richiesta di contatto. ` +
+      `Ciao ${displayName}! Sono Sara di AutoExperience, ricevo la tua richiesta di contatto. ` +
       `Per consigliarti meglio, posso farti qualche domanda veloce sul tuo noleggio?`;
     await executeChannelAction({
       primary,
       actionTaken,
       phone,
-      firstName,
+      firstName: displayName,
       scheduledFor,
       smsOpeningBody,
       smsCourtesyIntro: 'grazie per la tua richiesta di contatto!',
-      vapiVariables: { first_name: firstName },
+      vapiVariables: { first_name: displayName },
       endpoint: ENDPOINT,
       log,
     });
