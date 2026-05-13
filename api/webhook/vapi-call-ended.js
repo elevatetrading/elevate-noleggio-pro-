@@ -104,6 +104,9 @@ urgenza — SOLO questi valori esatti: "1 mese" | "3 mesi" | "6 mesi" | "valutan
 
 durata_mesi — numero intero oppure null (es. 36, 48, 60)
 
+# REGOLA INVIOLABILE: null onesto > dato inventato
+Se nel transcript NON c'è una dichiarazione esplicita del lead per un campo (es. il lead non ha mai detto esplicitamente i km/anno, il segmento auto, l'urgenza), DEVI restituire null per quel campo. NON inferire, NON inventare, NON usare valori di default. Se il transcript è dubbio o ambiguo per un campo, restituisci null. Meglio un null onesto che un dato inventato.
+
 # SCORE (valori interi 0-100, OBBLIGATORI, mai null)
 intent_score: quanto il lead sembra deciso ad andare avanti con il noleggio
 qualifica_score: quante informazioni utili ha fornito (tipo cliente, km, auto, durata)
@@ -325,38 +328,58 @@ export default async function handler(req, res) {
 
       console.log(`[${timestamp}] [${ENDPOINT}] Contatto GHL: ${contact.id} (${contact.firstName ?? phone})`);
 
+      // ── Rilevamento no_conversation (skip LLM se lead non ha parlato) ────
+      const durationSeconds = (() => {
+        const direct = extractVapiField(body, 'message.durationSeconds', 'durationSeconds');
+        if (direct != null) return Number(direct);
+        const start = extractVapiField(body, 'message.startedAt', 'message.call.startedAt');
+        const end   = extractVapiField(body, 'message.endedAt',   'message.call.endedAt');
+        if (start && end) return Math.round((new Date(end) - new Date(start)) / 1000);
+        return null;
+      })();
+      const parole_lead = userText.split(/\s+/).filter(Boolean).length;
+      const noConversation =
+        (durationSeconds !== null && durationSeconds < 15) ||
+        userMsgCount < 2 ||
+        parole_lead < 10;
+      if (noConversation) {
+        console.log(`[${ENDPOINT}] no_conversation detected (durata=${durationSeconds}, turni_lead=${userMsgCount}, parole_lead=${parole_lead}), skip extraction`);
+      }
+
       // ── Estrazione strutturata qualifica via LLM ─────────────────────────
       const STRUCT_KEYS = ['tipo_cliente', 'km_anno', 'segmento_auto', 'urgenza', 'durata_mesi'];
       let extracted = {};
 
-      const transcriptString = buildTranscriptString(artifactMessages);
-      if (transcriptString.length > 0) {
-        try {
-          const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-          const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            temperature: 0,
-            max_tokens: 300,
-            messages: [
-              { role: 'system', content: EXTRACTION_PROMPT },
-              { role: 'user', content: transcriptString },
-            ],
-          });
-          const raw = completion.choices[0].message.content;
-          const parsed = parseJsonSafe(raw);
-          if (parsed) {
-            extracted = parsed;
-            console.log(`[${ENDPOINT}] LLM raw JSON: ${JSON.stringify(parsed)}`);
-            console.log(
-              `[${ENDPOINT}] LLM extraction OK: tipo_cliente=${extracted.tipo_cliente} ` +
-              `km_anno=${extracted.km_anno} segmento=${extracted.segmento_auto} ` +
-              `urgenza=${extracted.urgenza} durata=${extracted.durata_mesi}`
-            );
-          } else {
-            console.warn(`[${ENDPOINT}] WARN: LLM extraction parse failed — raw: ${raw}`);
+      if (!noConversation) {
+        const transcriptString = buildTranscriptString(artifactMessages);
+        if (transcriptString.length > 0) {
+          try {
+            const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+            const completion = await openai.chat.completions.create({
+              model: 'gpt-4o-mini',
+              temperature: 0,
+              max_tokens: 300,
+              messages: [
+                { role: 'system', content: EXTRACTION_PROMPT },
+                { role: 'user', content: transcriptString },
+              ],
+            });
+            const raw = completion.choices[0].message.content;
+            const parsed = parseJsonSafe(raw);
+            if (parsed) {
+              extracted = parsed;
+              console.log(`[${ENDPOINT}] LLM raw JSON: ${JSON.stringify(parsed)}`);
+              console.log(
+                `[${ENDPOINT}] LLM extraction OK: tipo_cliente=${extracted.tipo_cliente} ` +
+                `km_anno=${extracted.km_anno} segmento=${extracted.segmento_auto} ` +
+                `urgenza=${extracted.urgenza} durata=${extracted.durata_mesi}`
+              );
+            } else {
+              console.warn(`[${ENDPOINT}] WARN: LLM extraction parse failed — raw: ${raw}`);
+            }
+          } catch (e) {
+            console.warn(`[${ENDPOINT}] WARN: LLM extraction failed: ${e.message}`);
           }
-        } catch (e) {
-          console.warn(`[${ENDPOINT}] WARN: LLM extraction failed: ${e.message}`);
         }
       }
 
@@ -364,7 +387,9 @@ export default async function handler(req, res) {
       const intentScore    = Number(extracted.intent_score    ?? 0);
       const qualificaScore = Number(extracted.qualifica_score ?? 0);
       const engagementScore = Number(extracted.engagement_score ?? 0);
-      const computedLeadScore = Math.round(0.4 * intentScore + 0.4 * qualificaScore + 0.2 * engagementScore);
+      const computedLeadScore = noConversation
+        ? 0
+        : Math.round(0.4 * intentScore + 0.4 * qualificaScore + 0.2 * engagementScore);
       console.log(`[${ENDPOINT}] LLM scores: intent=${intentScore} qualifica=${qualificaScore} engagement=${engagementScore} → lead_score=${computedLeadScore}`);
 
       // Campi già popolati nel contatto GHL (da quiz o interazioni precedenti)
@@ -374,25 +399,29 @@ export default async function handler(req, res) {
           .map((f) => f.key ?? f.id)
       );
 
-      // Sempre sovrascritti: ai_call_summary (dal LLM, fallback a Vapi), ai_call_outcome, lead_score
-      const callSummary = (extracted.ai_call_summary ?? '').trim() || summary;
+      const finalOutcome = noConversation ? 'no_conversation' : outcome;
+      const callSummary = noConversation
+        ? 'Chiamata non andata a buon fine — lead non ha risposto, è stato silente o ha chiuso subito. Da richiamare manualmente.'
+        : ((extracted.ai_call_summary ?? '').trim() || summary);
       const fieldsToWrite = [
         { key: 'ai_call_summary', value: callSummary },
-        { key: 'ai_call_outcome', value: outcome },
+        { key: 'ai_call_outcome', value: finalOutcome },
         { key: 'lead_score',      value: String(computedLeadScore) },
       ];
 
       let written = fieldsToWrite.length;
       let preserved = 0;
-      for (const key of STRUCT_KEYS) {
-        const val = extracted[key];
-        if (val === null || val === undefined) continue;
-        if (existingKeys.has(key)) {
-          preserved++;
-          console.log(`[${ENDPOINT}] Preserve existing GHL field: ${key}`);
-        } else {
-          fieldsToWrite.push({ key, value: String(val) });
-          written++;
+      if (!noConversation) {
+        for (const key of STRUCT_KEYS) {
+          const val = extracted[key];
+          if (val === null || val === undefined) continue;
+          if (existingKeys.has(key)) {
+            preserved++;
+            console.log(`[${ENDPOINT}] Preserve existing GHL field: ${key}`);
+          } else {
+            fieldsToWrite.push({ key, value: String(val) });
+            written++;
+          }
         }
       }
 
