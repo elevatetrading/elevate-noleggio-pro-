@@ -10,6 +10,7 @@ import {
   moveOpportunityToHotLead,
 } from '../../lib/ghl.js';
 import { TTL_RECOVERY_SMS } from '../../lib/redis-config.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'vapi-call-ended';
@@ -37,7 +38,6 @@ const VOICEMAIL_KEYWORDS = [
 
 const USER_ROLES = new Set(['user', 'customer']);
 
-// Single-word tokens covering all Italian greeting/opener/filler phrases.
 const GREETING_TOKENS = new Set([
   'pronto', 'sì', 'si', 'sono', 'io', 'chi', 'parla', 'è', 'sei',
   'salve', 'ciao', 'buongiorno', 'buona', 'giornata', 'buonasera',
@@ -45,7 +45,6 @@ const GREETING_TOKENS = new Set([
   'mh', 'eh', 'ah', 'uhm',
 ]);
 
-// Returns concatenated text of significant user messages + count.
 function analyzeUserMessages(messages) {
   if (!Array.isArray(messages)) return { text: '', count: 0 };
   const parts = [];
@@ -62,7 +61,6 @@ function hasVoicemailKeyword(text) {
   return VOICEMAIL_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-// Returns true if every word in text is a known Italian greeting/opener/filler.
 function isOnlyGreetings(text) {
   if (!text) return true;
   const tokens = text
@@ -105,7 +103,7 @@ urgenza — SOLO questi valori esatti: "1 mese" | "3 mesi" | "6 mesi" | "valutan
 durata_mesi — numero intero oppure null (es. 36, 48, 60)
 
 # REGOLA INVIOLABILE: null onesto > dato inventato
-Se nel transcript NON c'è una dichiarazione esplicita del lead per un campo (es. il lead non ha mai detto esplicitamente i km/anno, il segmento auto, l'urgenza), DEVI restituire null per quel campo. NON inferire, NON inventare, NON usare valori di default. Se il transcript è dubbio o ambiguo per un campo, restituisci null. Meglio un null onesto che un dato inventato.
+Se nel transcript NON c'è una dichiarazione esplicita del lead per un campo, DEVI restituire null per quel campo.
 
 # SCORE (valori interi 0-100, OBBLIGATORI, mai null)
 intent_score: quanto il lead sembra deciso ad andare avanti con il noleggio
@@ -147,7 +145,6 @@ function internalUrl(path) {
   return `http://localhost:3000${path}`;
 }
 
-// Naviga un path dot-separated nel body Vapi, prova più varianti in ordine.
 function extractVapiField(body, ...paths) {
   for (const path of paths) {
     let val = body;
@@ -175,20 +172,17 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Log raw sempre — critico per debug payload Vapi
     console.log(`[${ENDPOINT}] RAW BODY:`, JSON.stringify(req.body));
 
     const body = req.body ?? {};
     const message = body.message;
 
-    // Vapi invia vari tipi di evento — processiamo solo la fine chiamata
     const eventType = message?.type ?? body.type;
     if (eventType !== 'end-of-call-report') {
       console.log(`[${timestamp}] [${ENDPOINT}] Evento ignorato: type=${eventType}`);
       return res.status(200).json({ ok: true, ignored: true });
     }
 
-    // Estrazione robusta: il nesting Vapi varia tra versioni API
     const phone = extractVapiField(body,
       'message.call.customer.number',
       'call.customer.number',
@@ -224,16 +218,17 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'warning_unknown_reason' });
     }
 
+    // Leggi vertical da Redis (best-effort — potrebbe essere scaduto)
+    const vertical = (await redis.get(`vertical:${phone}`)) ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+    console.log(`[${ENDPOINT}] vertical=${vertical}`);
+
     const { text: userText, count: userMsgCount } = analyzeUserMessages(artifactMessages);
     const vk = hasVoicemailKeyword(transcript);
     const onlyGreetings = isOnlyGreetings(userText);
     console.log(`[${ENDPOINT}] User transcript: "${userText}" (length=${userText.length}, onlyGreetings=${onlyGreetings})`);
 
-    // Real conversation only if ALL 4 conditions hold:
-    //   1. userText.length >= 15 OR msgCount >= 2
-    //   2. user transcript is not only greetings/openers
-    //   3. no voicemail keywords in transcript
-    //   4. endedReason not in explicit no-answer set
     const recovery =
       NO_ANSWER_REASONS.has(endedReason) ||
       vk ||
@@ -243,22 +238,20 @@ export default async function handler(req, res) {
     const outcome = recovery ? 'no_answer_effective' : 'completed_normally';
     console.log(`[${ENDPOINT}] Classification: outcome=${outcome}`);
 
-    // ── RAMO RECOVERY — lead non ha avuto interazione vocale reale ────────
+    // ── RAMO RECOVERY ────────────────────────────────────────────────────
     if (recovery) {
       console.log(`[${ENDPOINT}] Recovery SMS WILL be sent`);
 
-      // Idempotenza: blocca doppi invii (Vapi può mandare l'evento 2-3 volte)
       const alreadySent = await redis.get(`recovery_sms_sent:${phone}`);
       if (alreadySent) {
         console.log(`[${timestamp}] [${ENDPOINT}] Recovery SMS già inviato, skip per evitare duplicati`);
         return res.status(200).json({ ok: true, action: 'skipped_duplicate' });
       }
 
-      // Recupera first_name da GHL
       let firstName = null;
       let contactId = null;
       try {
-        const contact = await findContactByPhone(phone);
+        const contact = await findContactByPhone(phone, ghlConfig);
         firstName = contact?.firstName ?? null;
         contactId = contact?.id ?? null;
         console.log(`[${timestamp}] [${ENDPOINT}] Contact: ${contactId} firstName=${firstName}`);
@@ -266,7 +259,6 @@ export default async function handler(req, res) {
         console.warn(`[${timestamp}] [${ENDPOINT}] WARN: GHL contact fetch failed: ${e.message}`);
       }
 
-      // SMS di recovery
       const greeting = firstName ? `Ciao ${firstName}` : 'Ciao';
       const smsBody =
         `${greeting}, ti ho appena chiamata ma non sono riuscita a sentirti. ` +
@@ -288,15 +280,13 @@ export default async function handler(req, res) {
         console.error(`[${timestamp}] [${ENDPOINT}] ERROR SMS: ${e.message}`);
       }
 
-      // Redis: engaged fisso 24h + anti-duplicato configurabile
       await redis.set(`engaged:${phone}`, '1', { ex: 86400 });
       console.log(`[${ENDPOINT}] Setting key recovery_sms_sent TTL=${TTL_RECOVERY_SMS}s`);
       await redis.set(`recovery_sms_sent:${phone}`, '1', { ex: TTL_RECOVERY_SMS });
 
-      // GHL: tag + custom fields (best effort, non bloccano il flusso)
       if (contactId) {
         try {
-          await addContactTags(contactId, ['call_no_answer', 'engaged_sms']);
+          await addContactTags(contactId, ['call_no_answer', 'engaged_sms'], ghlConfig);
         } catch (e) {
           console.warn(`[${timestamp}] [${ENDPOINT}] WARN: GHL tag add failed: ${e.message}`);
         }
@@ -304,7 +294,7 @@ export default async function handler(req, res) {
           await updateContactFields(contactId, [
             { key: 'channel_status', value: 'engaged_sms_recovery' },
             { key: 'ai_call_outcome', value: 'no_answer_recovery_sent' },
-          ]);
+          ], ghlConfig);
         } catch (e) {
           console.warn(`[${timestamp}] [${ENDPOINT}] WARN: GHL fields update failed: ${e.message}`);
         }
@@ -313,14 +303,14 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'recovery_sms_sent' });
     }
 
-    // ── RAMO CONVERSAZIONE REALE — aggiornamento GHL + hot-lead handoff ──
+    // ── RAMO CONVERSAZIONE REALE ─────────────────────────────────────────
     {
       console.log(`[${ENDPOINT}] Skipping recovery (real conversation occurred)`);
       console.log(`[${timestamp}] [${ENDPOINT}] Call completed normally, endedReason=${endedReason} outcome=${outcome}`);
       console.log(`[${timestamp}] [${ENDPOINT}] Summary: ${summary}`);
       console.log(`[${timestamp}] [${ENDPOINT}] Transcript (${transcript.length} chars)`);
 
-      const contact = await findContactByPhone(phone);
+      const contact = await findContactByPhone(phone, ghlConfig);
       if (!contact) {
         console.warn(`[${timestamp}] [${ENDPOINT}] Contatto GHL non trovato per ${phone}`);
         return res.status(200).json({ ok: true, action: 'call_completed_normally' });
@@ -328,7 +318,7 @@ export default async function handler(req, res) {
 
       console.log(`[${timestamp}] [${ENDPOINT}] Contatto GHL: ${contact.id} (${contact.firstName ?? phone})`);
 
-      // ── Rilevamento no_conversation (skip LLM se lead non ha parlato) ────
+      // ── Rilevamento no_conversation ───────────────────────────────────────
       const durationSeconds = (() => {
         const direct = extractVapiField(body, 'message.durationSeconds', 'durationSeconds');
         if (direct != null) return Number(direct);
@@ -346,7 +336,7 @@ export default async function handler(req, res) {
         console.log(`[${ENDPOINT}] no_conversation detected (durata=${durationSeconds}, turni_lead=${userMsgCount}, parole_lead=${parole_lead}), skip extraction`);
       }
 
-      // ── Estrazione strutturata qualifica via LLM ─────────────────────────
+      // ── Estrazione strutturata qualifica via LLM ──────────────────────────
       const STRUCT_KEYS = ['tipo_cliente', 'km_anno', 'segmento_auto', 'urgenza', 'durata_mesi'];
       let extracted = {};
 
@@ -383,7 +373,6 @@ export default async function handler(req, res) {
         }
       }
 
-      // Calcola lead_score da score LLM (formula identica a score-update.js)
       const intentScore    = Number(extracted.intent_score    ?? 0);
       const qualificaScore = Number(extracted.qualifica_score ?? 0);
       const engagementScore = Number(extracted.engagement_score ?? 0);
@@ -392,7 +381,6 @@ export default async function handler(req, res) {
         : Math.round(0.4 * intentScore + 0.4 * qualificaScore + 0.2 * engagementScore);
       console.log(`[${ENDPOINT}] LLM scores: intent=${intentScore} qualifica=${qualificaScore} engagement=${engagementScore} → lead_score=${computedLeadScore}`);
 
-      // Campi già popolati nel contatto GHL (da quiz o interazioni precedenti)
       const existingKeys = new Set(
         (contact.customFields ?? [])
           .filter((f) => f.value !== null && f.value !== '' && f.value !== undefined)
@@ -425,26 +413,26 @@ export default async function handler(req, res) {
         }
       }
 
-      await updateContactFields(contact.id, fieldsToWrite);
+      await updateContactFields(contact.id, fieldsToWrite, ghlConfig);
       console.log(`[${ENDPOINT}] GHL custom fields updated: ${written} campi scritti, ${preserved} preservati`);
 
       // ── Hot-lead handoff ──────────────────────────────────────────────────
       const sdOutcome = structuredData?.outcome ?? '';
-      const isHot = HOT_OUTCOMES.has(sdOutcome) || computedLeadScore >= 70;
+      const isHot = HOT_OUTCOMES.has(sdOutcome) || computedLeadScore >= config.handoff_threshold;
 
       if (isHot) {
         const alreadyDone = await redis.get(`handoff_done:${phone}`);
         if (!alreadyDone) {
           console.log(`[${timestamp}] [${ENDPOINT}] Lead caldo — avvio handoff per ${phone}`);
-          const opp = await findOpportunity(contact.id);
+          const opp = await findOpportunity(contact.id, ghlConfig);
           if (opp) {
-            await moveOpportunityToHotLead(opp.id);
+            await moveOpportunityToHotLead(opp.id, ghlConfig);
             console.log(`[${timestamp}] [${ENDPOINT}] Opportunity ${opp.id} → Hot Lead stage`);
           }
           try {
             await axios.post(
               internalUrl('/api/webhook/hot-lead-handoff'),
-              { phone },
+              { phone, vertical },
               { timeout: 8000 }
             );
           } catch (e) {

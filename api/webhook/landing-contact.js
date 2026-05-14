@@ -6,6 +6,7 @@ import {
   executeChannelAction,
 } from '../../lib/channel-actions.js';
 import { upsertContact } from '../../lib/ghl.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'landing-contact';
@@ -23,8 +24,6 @@ function setCorsHeaders(req, res) {
   } else if (!origin) {
     // Server-to-server call — nessun header CORS necessario
   } else {
-    // Origin non in lista — riflettiamo comunque per non bloccare test locali,
-    // ma logghiamo il warning
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
@@ -55,7 +54,14 @@ export default async function handler(req, res) {
     const {
       first_name, last_name, phone: rawPhone, email, preferred_channel,
       tipo_cliente, km_anno, segmento_auto, urgenza, durata_mesi,
+      vertical: rawVertical,
     } = req.body ?? {};
+
+    const vertical = rawVertical ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+
+    log(`vertical=${vertical}`);
 
     // ── Unico campo obbligatorio: phone ───────────────────────────────────
     if (!rawPhone) {
@@ -67,7 +73,6 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: `Numero di telefono non valido: "${rawPhone}"` });
     }
 
-    // Campi opzionali con default
     const firstName = first_name ? String(first_name).trim() : '';
     const explicitLastName = last_name ? String(last_name).trim() : '';
     const lastName = explicitLastName || (() => {
@@ -76,7 +81,7 @@ export default async function handler(req, res) {
       log(`last_name generato: ${generated}`);
       return generated;
     })();
-    const channel   = preferred_channel ?? 'phone';
+    const channel = preferred_channel ?? 'phone';
 
     if (email && !isValidEmail(email)) {
       return res.status(400).json({ error: `Email non valida: "${email}"` });
@@ -109,7 +114,7 @@ export default async function handler(req, res) {
     ].filter(Boolean);
 
     const upsertPayload = {
-      locationId: process.env.GHL_LOCATION_ID,
+      locationId: config.ghl_location_id,
       ...(firstName && { firstName }),
       lastName,
       phone,
@@ -118,7 +123,7 @@ export default async function handler(req, res) {
       customFields,
     };
 
-    const { contactId } = await upsertContact(upsertPayload, phone);
+    const { contactId } = await upsertContact(upsertPayload, phone, ghlConfig);
 
     if (whatsappDegraded) {
       log(`WARN: WhatsApp request degraded to SMS, contact_id=${contactId}`);
@@ -138,6 +143,7 @@ export default async function handler(req, res) {
       smsOpeningBody,
       smsCourtesyIntro: 'grazie per la tua richiesta di contatto!',
       vapiVariables: { first_name: displayName },
+      vapiAssistantId: config.vapi_assistant_id,
       endpoint: ENDPOINT,
       log,
     });
@@ -150,6 +156,7 @@ export default async function handler(req, res) {
         primary,
         ...(scheduledFor && { scheduledFor: scheduledFor.toISOString() }),
         contact_id: contactId,
+        vertical,
         timestamp,
       }),
       { ex: 86400 }

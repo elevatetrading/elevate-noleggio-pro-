@@ -1,5 +1,6 @@
 import twilio from 'twilio';
 import { Redis } from '@upstash/redis';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'quiz-submitted';
@@ -24,13 +25,16 @@ export default async function handler(req, res) {
       durata_mesi,
       segmento_auto,
       urgenza,
+      vertical: rawVertical,
     } = payload;
 
+    const vertical = rawVertical ?? 'noleggio';
+    const config = getConfig(vertical);
+
+    console.log(`[${timestamp}] [${ENDPOINT}] vertical=${vertical}`);
+
     // --- SMS iniziale di apertura conversazione ---
-    const greeting = first_name ? `Ciao ${first_name}!` : 'Ciao!';
-    const smsBody =
-      `${greeting} Sono Sara di AutoExperience. Hai appena compilato il quiz sul noleggio. ` +
-      `Posso farti un paio di domande veloci per capire come posso aiutarti?`;
+    const smsBody = config.sms_opening(first_name);
 
     try {
       const twilioClient = twilio(
@@ -48,8 +52,6 @@ export default async function handler(req, res) {
     }
 
     // Salva i dati del lead su Redis con TTL 600s (10 min)
-    // Se il lead risponde via SMS prima dello scadere, incoming-sms.js cancella questa chiave
-    // e GHL non riceverà conferma per avviare la Vapi call
     const redisKey = `vapi_pending:${phone}`;
     await redis.set(
       redisKey,
@@ -57,6 +59,10 @@ export default async function handler(req, res) {
       { ex: 600 }
     );
     console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Redis: chiave "${redisKey}" salvata con TTL 600s`);
+
+    // Salva il vertical associato al numero — usato da incoming-sms e altri handler
+    await redis.set(`vertical:${phone}`, vertical, { ex: 600 });
+    console.log(`[${new Date().toISOString()}] [${ENDPOINT}] Redis: chiave "vertical:${phone}" salvata con TTL 600s`);
 
     return res.status(200).json({ ok: true, sms_sent: true, vapi_scheduled: true });
   } catch (err) {

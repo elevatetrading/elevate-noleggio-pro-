@@ -10,6 +10,7 @@ import {
   setContactDnd,
 } from '../../lib/ghl.js';
 import { schedulePost, cancelMessage } from '../../lib/qstash.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'incoming-sms';
@@ -72,70 +73,9 @@ function getRomeDateTime() {
   return `${dateStr}, ore ${timeStr}`;
 }
 
-function buildSystemPrompt() {
+function buildSystemPrompt(chatPrompt) {
   const currentDateTime = getRomeDateTime();
-  return `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)
-
-# RUOLO
-Sei Sara, assistente di AutoExperience (noleggio a lungo termine, Siracusa). Rispondi via SMS a un lead che ha compilato un quiz sul sito o che ha ricevuto un SMS di recupero dopo una chiamata senza risposta.
-
-# OBIETTIVO
-Classificare l'intent del messaggio e rispondere in modo appropriato. Se il lead vuole essere richiamato, conferma l'orario. Se vuole qualificarsi via chat, raccogli: tipo cliente (privato o p.iva), km/anno, tipo auto (city car/berlina/SUV/premium), urgenza. Se non è interessato, chiudi cortesemente.
-
-# TONO E STILE SMS
-- Frasi brevi, max 2 per messaggio
-- Italiano semplice, mai formale-aulico
-- Risposte da 1-3 righe massimo
-- Cordialità senza esagerazioni
-
-# REGOLE INVIOLABILI
-- MAI dare prezzi specifici. Se chiedono: "Non posso darti cifre precise via SMS, dipende da configurazione, durata e km. Te le farà sapere il commerciale in un preventivo personalizzato."
-- MAI inventare modelli auto, promozioni, o disponibilità
-- Se chiede umano subito: "Certo, ti faccio richiamare. Posso solo chiederti nome e tipo di noleggio per girare la richiesta giusta?"
-- Se ostile: scusa breve, chiudi senza insistere
-- Se non interessato: ringrazia, chiudi
-
-# INTENT CLASSIFICATION
-Classifica ogni messaggio in una di queste categorie:
-
-**"schedule"** — il lead vuole essere richiamato in un momento specifico:
-  - "domani alle 15", "venerdì pomeriggio", "stasera dopo le 19", "chiamami il 14 maggio"
-  - "richiamatemi tra 2 ore", "mi va meglio domani mattina", "mi chiami nel pomeriggio"
-  - Se dice un'ora senza giorno: oggi se è nel futuro, domani se è già passata
-
-**"qualify"** — risponde a domande di Sara o chiede info specifiche su preventivo/durata/marche:
-  - "quanto costa una BMW serie 3?", "fate noleggio per p.iva?", "faccio circa 15000 km l'anno"
-
-**"rejection"** — non è interessato o vuole essere rimosso:
-  - "non sono interessato", "non chiamatemi più", "rimuovete il mio numero", "basta"
-
-**"info_only"** — richiesta generica senza intenzione chiara:
-  - "ditemi qualcosa", "come funziona", "che marche avete", "ciao"
-
-# REGOLE PARSING DATA/ORA (usa "Data/ora corrente" sopra come riferimento)
-- "oggi" → data odierna
-- "domani" → data odierna + 1 giorno
-- "dopodomani" → data odierna + 2 giorni
-- "lunedì/martedì/.../domenica prossimo/a" → prossima occorrenza (se oggi è già quel giorno, la settimana successiva)
-- "mattina" senza orario → 10:00; "pomeriggio" → 15:00; "sera" → 18:00
-- "alle 15", "alle tre", "alle 3 di pomeriggio" → ora esatta
-- Se orario ambiguo o impossibile: restituisci \`scheduled_datetime: null\` e chiedi chiarimento nella response
-- \`scheduled_datetime\` in formato ISO 8601 con offset Europe/Rome, es. "2026-05-13T15:00:00+02:00"
-
-# CHIUSURA QUALIFICA
-Quando hai info sufficienti: "Perfetto, ti faccio richiamare a breve da un commerciale per un preventivo personalizzato. Buona giornata!"
-
-# OUTPUT JSON
-Rispondi SEMPRE e SOLO con un oggetto JSON valido, senza markdown. Struttura:
-{
-  "intent": "schedule" | "qualify" | "rejection" | "info_only",
-  "scheduled_datetime": "ISO 8601 string" | null,
-  "response": "<messaggio SMS da inviare al lead, max 3 righe>",
-  "intent_score": <0-100>,
-  "qualifica_score": <0-100>,
-  "engagement_score": <0-100>,
-  "ready_for_handoff": <true | false>
-}`;
+  return `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)\n\n${chatPrompt}`;
 }
 
 export default async function handler(req, res) {
@@ -158,6 +98,12 @@ export default async function handler(req, res) {
     const incomingText = raw.Body;
 
     console.log(`[${timestamp}] [${ENDPOINT}] SMS da ${from}: "${incomingText}"`);
+
+    // Leggi il vertical del lead da Redis (salvato da quiz-submitted o altri handler)
+    const vertical = (await redis.get(`vertical:${from}`)) ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+    console.log(`[${ENDPOINT}] vertical=${vertical}`);
 
     // Il lead sta interagendo via SMS — cancella eventuale chiamata Vapi pendente
     const deleted = await redis.del(`vapi_pending:${from}`);
@@ -190,7 +136,7 @@ export default async function handler(req, res) {
       }));
 
     const messages = [
-      { role: 'system', content: buildSystemPrompt() },
+      { role: 'system', content: buildSystemPrompt(config.chat_setter_prompt) },
       ...history,
       { role: 'user', content: incomingText },
     ];
@@ -225,7 +171,6 @@ export default async function handler(req, res) {
       if (cancelledCount) {
         console.log(`[incoming-sms] Scheduled call CANCELLED for ${from} due to lead message`);
       }
-      // Cancella anche il messaggio QStash se già schedulato
       const qstashMsgId = await redis.get(`qstash_message_id:${from}`);
       if (qstashMsgId) {
         try {
@@ -251,12 +196,12 @@ export default async function handler(req, res) {
 
           let contactId = null;
           try {
-            const contact = await findContactByPhone(from);
+            const contact = await findContactByPhone(from, ghlConfig);
             if (contact) {
               contactId = contact.id;
               await Promise.all([
-                updateContactFields(contact.id, [{ key: 'next_contact_at', value: scheduledDatetime }]),
-                addContactTags(contact.id, ['scheduled_call_set', 'engaged_sms']),
+                updateContactFields(contact.id, [{ key: 'next_contact_at', value: scheduledDatetime }], ghlConfig),
+                addContactTags(contact.id, ['scheduled_call_set', 'engaged_sms'], ghlConfig),
               ]);
             }
           } catch (e) {
@@ -268,7 +213,7 @@ export default async function handler(req, res) {
             try {
               const unixTimestamp = Math.floor(scheduledAt.getTime() / 1000);
               const targetUrl = qstashCallbackUrl('/api/webhook/execute-scheduled-call');
-              const messageId = await schedulePost(targetUrl, { phone: from, contact_id: contactId }, unixTimestamp);
+              const messageId = await schedulePost(targetUrl, { phone: from, contact_id: contactId, vertical }, unixTimestamp);
               const msgTtl = Math.max(3600, secondsUntil + 3600);
               await redis.set(`qstash_message_id:${from}`, messageId, { ex: msgTtl });
               console.log(`[incoming-sms] QStash scheduled message_id=${messageId} for_datetime=${scheduledDatetime} unix=${unixTimestamp}`);
@@ -287,8 +232,8 @@ export default async function handler(req, res) {
       } else {
         // LLM ha restituito intent=schedule ma senza orario — ha già chiesto chiarimento
         try {
-          const contact = await findContactByPhone(from);
-          if (contact) await addContactTags(contact.id, ['scheduling_in_progress']);
+          const contact = await findContactByPhone(from, ghlConfig);
+          if (contact) await addContactTags(contact.id, ['scheduling_in_progress'], ghlConfig);
         } catch (e) {
           console.warn(`[${ENDPOINT}] WARN: GHL tag failed: ${e.message}`);
         }
@@ -297,10 +242,10 @@ export default async function handler(req, res) {
 
     } else if (intent === 'rejection') {
       try {
-        const contact = await findContactByPhone(from);
+        const contact = await findContactByPhone(from, ghlConfig);
         if (contact) {
-          await addContactTags(contact.id, ['rejected_by_lead']);
-          await setContactDnd(contact.id);
+          await addContactTags(contact.id, ['rejected_by_lead'], ghlConfig);
+          await setContactDnd(contact.id, ghlConfig);
         }
       } catch (e) {
         console.warn(`[${ENDPOINT}] WARN: GHL rejection update failed: ${e.message}`);
@@ -321,6 +266,7 @@ export default async function handler(req, res) {
             internalUrl('/api/webhook/score-update'),
             {
               phone: from,
+              vertical,
               intent_score: parsed.intent_score,
               qualifica_score: parsed.qualifica_score,
               engagement_score: parsed.engagement_score,

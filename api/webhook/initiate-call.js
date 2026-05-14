@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { Redis } from '@upstash/redis';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'initiate-call';
@@ -32,8 +33,12 @@ export default async function handler(req, res) {
     const durata_mesi  = getField(req.body, 'durata_mesi');
     const segmento_auto = getField(req.body, 'segmento_auto');
     const urgenza      = getField(req.body, 'urgenza');
+    const rawVertical  = getField(req.body, 'vertical');
 
-    console.log(`[${ENDPOINT}] Extracted phone=${phone} contact_id=${contact_id} first_name=${first_name}`);
+    const vertical = rawVertical ?? 'noleggio';
+    const config = getConfig(vertical);
+
+    console.log(`[${ENDPOINT}] Extracted phone=${phone} contact_id=${contact_id} first_name=${first_name} vertical=${vertical}`);
     console.log(`[${timestamp}] [${ENDPOINT}] Richiesta per ${phone} (contact_id: ${contact_id})`);
 
     const redisKey = `vapi_pending:${phone}`;
@@ -50,7 +55,7 @@ export default async function handler(req, res) {
 
     const callBody = {
       phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-      assistantId: process.env.VAPI_ASSISTANT_ID,
+      assistantId: config.vapi_assistant_id,
       customer: {
         number: phone,
       },

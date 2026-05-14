@@ -1,9 +1,10 @@
 import axios from 'axios';
 import { Redis } from '@upstash/redis';
 import { normalizePhone } from '../../lib/channel-actions.js';
-import { getContact, addContactTags, updateContactFields } from '../../lib/ghl.js';
+import { getContact, addContactTags, updateContactFields, findContactByPhone } from '../../lib/ghl.js';
 import { TTL_SCHEDULED_CALL_EXECUTED } from '../../lib/redis-config.js';
 import { qstashReceiver } from '../../lib/qstash.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'execute-scheduled-call';
@@ -20,8 +21,6 @@ function getField(body, key) {
 }
 
 // Ottiene il body come stringa raw per la verifica della firma QStash.
-// Vercel auto-parsifica JSON → req.body è già un oggetto. La re-serializzazione
-// funziona perché publishJSON ha usato JSON.stringify sullo stesso oggetto piatto.
 function getRawBody(req) {
   if (req.rawBody) {
     return typeof req.rawBody === 'string' ? req.rawBody : req.rawBody.toString('utf8');
@@ -76,7 +75,13 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: `Invalid phone: "${rawPhone}"` });
     }
 
-    console.log(`[${ENDPOINT}] Received phone=${phone} contact_id=${contactId}`);
+    // Leggi vertical dal payload (passato da incoming-sms via QStash) o da Redis come fallback
+    const payloadVertical = getField(req.body, 'vertical');
+    const vertical = payloadVertical ?? (await redis.get(`vertical:${phone}`)) ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+
+    console.log(`[${ENDPOINT}] Received phone=${phone} contact_id=${contactId} vertical=${vertical}`);
 
     // ── Idempotenza ──────────────────────────────────────────────────────────
     const alreadyExecuted = await redis.get(`scheduled_call_executed:${phone}`);
@@ -97,8 +102,8 @@ export default async function handler(req, res) {
     let resolvedContactId = contactId;
     try {
       const contact = contactId
-        ? await getContact(contactId)
-        : await (await import('../../lib/ghl.js')).findContactByPhone(phone);
+        ? await getContact(contactId, ghlConfig)
+        : await findContactByPhone(phone, ghlConfig);
       if (contact) {
         firstName = contact.firstName ?? '';
         resolvedContactId = resolvedContactId ?? contact.id;
@@ -116,7 +121,7 @@ export default async function handler(req, res) {
         'https://api.vapi.ai/call/phone',
         {
           phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-          assistantId: process.env.VAPI_ASSISTANT_ID,
+          assistantId: config.vapi_assistant_id,
           customer: { number: phone },
           assistantOverrides: {
             variableValues: { first_name: firstName },
@@ -149,8 +154,8 @@ export default async function handler(req, res) {
     if (resolvedContactId) {
       try {
         await Promise.all([
-          addContactTags(resolvedContactId, ['scheduled_call_executed']),
-          updateContactFields(resolvedContactId, [{ key: 'channel_status', value: 'call_in_progress' }]),
+          addContactTags(resolvedContactId, ['scheduled_call_executed'], ghlConfig),
+          updateContactFields(resolvedContactId, [{ key: 'channel_status', value: 'call_in_progress' }], ghlConfig),
         ]);
       } catch (e) {
         console.warn(`[${ENDPOINT}] WARN: GHL update failed: ${e.message}`);

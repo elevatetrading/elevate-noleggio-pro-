@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { Redis } from '@upstash/redis';
 import { normalizePhone, mapChannel, resolveChannelState, executeChannelAction } from '../../lib/channel-actions.js';
 import { upsertContact } from '../../lib/ghl.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'tally-submitted';
@@ -86,7 +87,6 @@ function buildFieldGetter(fields) {
 }
 
 // ─── extractConsents ──────────────────────────────────────────────────────────
-// I consensi Tally hanno label===null; il testo è in options[0].text.
 function extractConsents(fields) {
   const result = { consenso_privacy: null, consenso_chiamate: null, consenso_marketing: null };
   for (const f of fields ?? []) {
@@ -200,7 +200,12 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ignored: true });
     }
 
-    log(`formId: ${data?.formId} — responseId: ${data?.responseId}`);
+    // Leggi vertical dal payload (può essere passato come campo nascosto nel form Tally)
+    const vertical = req.body?.vertical ?? data?.vertical ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+
+    log(`formId: ${data?.formId} — responseId: ${data?.responseId} — vertical: ${vertical}`);
 
     // ── Estrai campi (UUID → testo) ───────────────────────────────────────
     const get = buildFieldGetter(data?.fields);
@@ -265,7 +270,7 @@ export default async function handler(req, res) {
 
     // ── Upsert contatto GHL ───────────────────────────────────────────────
     const upsertPayload = {
-      locationId: process.env.GHL_LOCATION_ID,
+      locationId: config.ghl_location_id,
       ...(first_name && { firstName: first_name }),
       phone,
       ...(email && { email }),
@@ -273,7 +278,7 @@ export default async function handler(req, res) {
       customFields,
     };
 
-    const { contactId } = await upsertContact(upsertPayload, phone);
+    const { contactId } = await upsertContact(upsertPayload, phone, ghlConfig);
 
     if (whatsappDegraded) {
       log(`WARN: WhatsApp request degraded to SMS, contact_id=${contactId}`);
@@ -292,6 +297,7 @@ export default async function handler(req, res) {
       smsOpeningBody,
       smsCourtesyIntro: 'grazie per aver compilato il quiz!',
       vapiVariables: { first_name, tipo_cliente, km_anno, segmento_auto, urgenza },
+      vapiAssistantId: config.vapi_assistant_id,
       endpoint: ENDPOINT,
       log,
     });
@@ -304,6 +310,7 @@ export default async function handler(req, res) {
         primary,
         ...(scheduledFor && { scheduledFor: scheduledFor.toISOString() }),
         contact_id: contactId,
+        vertical,
         timestamp,
       }),
       { ex: 86400 }

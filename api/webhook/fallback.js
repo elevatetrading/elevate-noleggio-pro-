@@ -4,12 +4,12 @@ import { Redis } from '@upstash/redis';
 import { normalizePhone, isCallingHourAllowed } from '../../lib/channel-actions.js';
 import { getContact, addContactTags } from '../../lib/ghl.js';
 import { TTL_FALLBACK_DONE } from '../../lib/redis-config.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const redis = Redis.fromEnv();
 const ENDPOINT = 'fallback';
 
-// Cerca un campo nel body supportando più strutture di wrapper GHL:
-// top-level, customData, extras, data (in ordine di priorità).
+// Cerca un campo nel body supportando più strutture di wrapper GHL.
 function getField(body, key) {
   return body?.[key]
     ?? body?.customData?.[key]
@@ -29,7 +29,6 @@ export default async function handler(req, res) {
   const log = (msg) => console.log(`[${new Date().toISOString()}] [${ENDPOINT}] ${msg}`);
 
   try {
-    // Log raw sempre — indispensabile per debuggare wrapper format sconosciuti
     console.log('[fallback] RAW BODY:', JSON.stringify(req.body));
     console.log('[fallback] HEADERS:', JSON.stringify(req.headers));
 
@@ -50,7 +49,13 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: `Invalid phone: "${rawPhone}"` });
     }
 
-    log(`Received phone=${phone} primary=${primary} contact_id=${contact_id}`);
+    // Leggi vertical dal payload o da Redis come fallback
+    const payloadVertical = getField(req.body, 'vertical');
+    const vertical = payloadVertical ?? (await redis.get(`vertical:${phone}`)) ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+
+    log(`Received phone=${phone} primary=${primary} contact_id=${contact_id} vertical=${vertical}`);
 
     // ── Step 3: Verifica fallback_done (idempotenza) ──────────────────────
     const donePrev = await redis.get(`fallback_done:${phone}`);
@@ -69,7 +74,7 @@ export default async function handler(req, res) {
     // ── Step 5: Verifica GHL — tag 'responded'/'engaged' + GET contatto ──
     let contact = null;
     try {
-      contact = await getContact(contact_id);
+      contact = await getContact(contact_id, ghlConfig);
       if (!contact) {
         log(`WARN: contact_id=${contact_id} non trovato su GHL — skip`);
         return res.status(200).json({ ok: true, action: 'skipped', reason: 'lead_already_engaged' });
@@ -122,7 +127,7 @@ export default async function handler(req, res) {
             'https://api.vapi.ai/call/phone',
             {
               phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-              assistantId: process.env.VAPI_ASSISTANT_ID,
+              assistantId: config.vapi_assistant_id,
               customer: { number: phone },
               assistantOverrides: { variableValues: { first_name: firstName ?? '' } },
             },
@@ -158,7 +163,7 @@ export default async function handler(req, res) {
         ghlTag = 'fallback:sms_reminder_sent';
       }
     } else {
-      // CASO B — lead aveva scelto chiamata, fallback → SMS (scuse in orario, reminder fuori orario)
+      // CASO B — lead aveva scelto chiamata, fallback → SMS
       let body;
       if (inHours) {
         log(`Executing branch=CASO_B_inHours action=fallback_sms_sent`);
@@ -190,9 +195,8 @@ export default async function handler(req, res) {
     log(`Setting key fallback_done TTL=${TTL_FALLBACK_DONE}s`);
     await redis.set(`fallback_done:${phone}`, '1', { ex: TTL_FALLBACK_DONE });
 
-    // Aggiungi tag GHL (best effort, non blocca il flusso)
     try {
-      await addContactTags(contact_id, [ghlTag]);
+      await addContactTags(contact_id, [ghlTag], ghlConfig);
       log(`GHL tag added: ${ghlTag}`);
     } catch (e) {
       log(`WARN: GHL tag add failed: ${e.message}`);

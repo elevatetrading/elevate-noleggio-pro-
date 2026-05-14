@@ -6,6 +6,7 @@ import {
   moveOpportunityToHotLead,
   createHandoffTask,
 } from '../../lib/ghl.js';
+import { getConfig } from '../../lib/verticals.js';
 
 const ENDPOINT = 'hot-lead-handoff';
 
@@ -18,10 +19,15 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { phone } = req.body;
-    console.log(`[${timestamp}] [${ENDPOINT}] Handoff per ${phone}`);
+    const { phone, vertical: rawVertical } = req.body;
 
-    const contact = await findContactByPhone(phone);
+    const vertical = rawVertical ?? 'noleggio';
+    const config = getConfig(vertical);
+    const ghlConfig = { apiKey: config.ghl_api_key, locationId: config.ghl_location_id };
+
+    console.log(`[${timestamp}] [${ENDPOINT}] Handoff per ${phone} (vertical=${vertical})`);
+
+    const contact = await findContactByPhone(phone, ghlConfig);
     if (!contact) {
       console.warn(`[${timestamp}] [${ENDPOINT}] Contatto non trovato per ${phone}`);
       return res.status(200).json({ ok: true, handoff_complete: false, reason: 'contact_not_found' });
@@ -69,13 +75,13 @@ export default async function handler(req, res) {
       .filter(Boolean)
       .join('\n');
 
-    await addContactNote(contact.id, noteBody);
+    await addContactNote(contact.id, noteBody, ghlConfig);
     console.log(`[${timestamp}] [${ENDPOINT}] Nota GHL aggiunta`);
 
     // Muovi opportunity a Hot Lead
-    const opp = await findOpportunity(contact.id);
+    const opp = await findOpportunity(contact.id, ghlConfig);
     if (opp) {
-      await moveOpportunityToHotLead(opp.id);
+      await moveOpportunityToHotLead(opp.id, ghlConfig);
       console.log(`[${timestamp}] [${ENDPOINT}] Opportunity ${opp.id} → Hot Lead stage`);
     } else {
       console.warn(`[${timestamp}] [${ENDPOINT}] Nessuna opportunity per contact ${contact.id}`);
@@ -86,7 +92,8 @@ export default async function handler(req, res) {
       await createHandoffTask(
         contact.id,
         `🔥 LEAD CALDO — ${firstName}`,
-        `Score ${leadScore}/100. ${aiSummary ? 'Vedi nota per briefing.' : 'Contatto solo via SMS.'} Richiama entro 30 min.`
+        `Score ${leadScore}/100. ${aiSummary ? 'Vedi nota per briefing.' : 'Contatto solo via SMS.'} Richiama entro 30 min.`,
+        ghlConfig
       );
       console.log(`[${timestamp}] [${ENDPOINT}] Task GHL creato`);
     } catch (e) {
@@ -94,7 +101,6 @@ export default async function handler(req, res) {
     }
 
     // SMS alert al commerciale
-    // Richiede env var COMMERCIALE_PHONE (numero del commerciale in E.164)
     if (process.env.COMMERCIALE_PHONE) {
       try {
         const twilioClient = twilio(
