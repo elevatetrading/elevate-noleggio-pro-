@@ -72,7 +72,7 @@ function getRomeDateTime() {
 
 function buildSystemPrompt(chatPrompt) {
   const currentDateTime = getRomeDateTime();
-  return `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)\n\n${chatPrompt}`;
+  return `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)\n\n${chatPrompt}\n\nRispondi sempre e solo in formato JSON.`;
 }
 
 export default async function handler(req, res) {
@@ -145,6 +145,7 @@ export default async function handler(req, res) {
       model: 'gpt-4o-mini',
       temperature: 0.6,
       max_tokens: 350,
+      response_format: { type: 'json_object' },
       messages,
     });
 
