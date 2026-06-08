@@ -15,9 +15,11 @@ import { getConfig } from '../../lib/verticals.js';
 const redis = Redis.fromEnv();
 const ENDPOINT = 'incoming-whatsapp';
 
+// Usa PUBLIC_BASE_URL (produzione) per chiamate interne — VERCEL_URL punta al
+// deployment corrente che può essere bloccato da Deployment Protection (401).
 function internalUrl(path) {
+  if (process.env.PUBLIC_BASE_URL) return `${process.env.PUBLIC_BASE_URL}${path}`;
   if (process.env.BASE_URL) return `${process.env.BASE_URL}${path}`;
-  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}${path}`;
   return `http://localhost:3000${path}`;
 }
 
