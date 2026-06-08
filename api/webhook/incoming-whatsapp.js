@@ -74,7 +74,14 @@ function getRomeDateTime() {
 
 function buildSystemPrompt(chatPrompt) {
   const currentDateTime = getRomeDateTime();
-  return `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)\n\n${chatPrompt}\n\nRispondi sempre e solo in formato JSON.`;
+  return (
+    `Data/ora corrente: ${currentDateTime} (fuso orario Europe/Rome)\n\n${chatPrompt}\n\n` +
+    `Rispondi sempre e solo in formato JSON. Il JSON deve includere il campo "extracted_data" con questa struttura:\n` +
+    `"extracted_data": { "tipo_cliente": null, "km_anno": null, "segmento_auto": null, "urgenza": null }\n` +
+    `Valori attesi: tipo_cliente = "privato"|"partita_iva", km_anno = numero intero, ` +
+    `segmento_auto = "city_car"|"berlina"|"suv"|"premium", urgenza = "1_mese"|"3_mesi"|"6_mesi"|"valutando". ` +
+    `Usa null per i campi non ancora emersi nella conversazione.`
+  );
 }
 
 export default async function handler(req, res) {
@@ -162,6 +169,24 @@ export default async function handler(req, res) {
     const scheduledDatetime = parsed?.scheduled_datetime ?? null;
 
     console.log(`[${ENDPOINT}] LLM response intent=${intent} scheduled_datetime=${scheduledDatetime} engagement_score=${parsed?.engagement_score ?? 'N/A'}`);
+
+    // Aggiorna i custom field GHL con i dati estratti dal LLM (non bloccante)
+    const extractedData = parsed?.extracted_data ?? {};
+    const extractedFields = Object.entries(extractedData)
+      .filter(([, v]) => v !== null && v !== undefined)
+      .map(([key, value]) => ({ key, value: String(value) }));
+
+    if (extractedFields.length > 0) {
+      try {
+        const contactForExtract = await findContactByPhone(phoneNumber, ghlConfig);
+        if (contactForExtract) {
+          await updateContactFields(contactForExtract.id, extractedFields, ghlConfig);
+          console.log(`[${ENDPOINT}] extracted_data → GHL: ${extractedFields.map((f) => `${f.key}=${f.value}`).join(', ')}`);
+        }
+      } catch (e) {
+        console.warn(`[${ENDPOINT}] WARN: GHL extracted_data update failed: ${e.message}`);
+      }
+    }
 
     // Invia sempre la risposta via WhatsApp
     await twilioClient.messages.create({ body: reply, from: ourWhatsApp, to: fromRaw });
