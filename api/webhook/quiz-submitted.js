@@ -43,10 +43,10 @@ export default async function handler(req, res) {
       );
       const smsResult = await twilioClient.messages.create({
         body: smsBody,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: phone,
+        from: 'whatsapp:+14155238886',
+        to: 'whatsapp:' + phone,
       });
-      console.log(`[${new Date().toISOString()}] [${ENDPOINT}] SMS inviato — sid: ${smsResult.sid}`);
+      console.log(`[${new Date().toISOString()}] [${ENDPOINT}] WhatsApp inviato — sid: ${smsResult.sid}`);
     } catch (smsErr) {
       console.error(`[${new Date().toISOString()}] [${ENDPOINT}] Errore invio SMS (non bloccante):`, smsErr.message);
     }
