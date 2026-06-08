@@ -42,13 +42,10 @@ function hasCancellationKeyword(text) {
 
 // Parser robusto per la risposta JSON di OpenAI (gestisce markdown code block)
 function parseOpenAiJson(content) {
-  try { return JSON.parse(content); } catch {}
+  const rawJson = content.replace(/```json[\s\S]*?```|```/g, '').trim();
+  try { return JSON.parse(rawJson); } catch {}
   try {
-    const clean = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-    return JSON.parse(clean);
-  } catch {}
-  try {
-    const match = content.match(/\{[\s\S]*\}/);
+    const match = rawJson.match(/\{[\s\S]*\}/);
     if (match) return JSON.parse(match[0]);
   } catch {}
   return null;
